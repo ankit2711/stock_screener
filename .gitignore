@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+venv/
+.venv/
+env/
+
+# Credentials — NEVER commit
+credentials.json
+*.key
+*.pem
+
+# Cache & databases
+cache/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+screener.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
