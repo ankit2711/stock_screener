@@ -44,6 +44,7 @@ import universe
 import universe_ai
 import sheets_writer
 import cache
+from drive_exporter import export_results
 from ranker_stage import run_screens_stage
 from ranker_sepa  import run_screens_sepa
 from ranker_trade import run_trade_scan
@@ -251,6 +252,9 @@ def run_india(screener: str = "stage") -> bool:
     logger.info("STEP 5: Writing India results to Google Sheets...")
     sheets_writer.write_results(results, market="india", screener=screener)
 
+    logger.info("STEP 6: Exporting India results to JSON → Google Drive...")
+    export_results(results, market="india", screener=screener)
+
     return True
 
 
@@ -291,6 +295,9 @@ def run_ai(screener: str = "stage") -> bool:
     logger.info("STEP 5: Writing AI Theme results to Google Sheets...")
     sheets_writer.write_results(results, market="ai", screener=screener)
 
+    logger.info("STEP 6: Exporting AI Theme results to JSON → Google Drive...")
+    export_results(results, market="ai", screener=screener)
+
     return True
 
 
@@ -328,6 +335,9 @@ def run_us(screener: str = "stage") -> bool:
 
     logger.info("STEP 5: Writing US results to Google Sheets...")
     sheets_writer.write_results(results, market="us", screener=screener)
+
+    logger.info("STEP 6: Exporting US results to JSON → Google Drive...")
+    export_results(results, market="us", screener=screener)
 
     return True
 

@@ -14,6 +14,11 @@ GOOGLE_SHEET_ID_INDIA = "1jXzBPKXXFWykibnK6KYHvPSDgCFJAScCDY0bI5EbV1c"  # India 
 GOOGLE_SHEET_ID_US    = "1UlHcYMW56Pv0P8YAj33N9wCMI6obs8VrzFwIqUFCjsc"  # US screener sheet
 GOOGLE_SHEET_ID_AI    = "1vqrDWPSFKtJhYqarrtfxNDCnnKSrc32J7ZN1mYPL-k8"  # AI Theme screener sheet
 
+# Google Drive folder — daily JSON exports are uploaded here after each run.
+# Folder URL: https://drive.google.com/drive/folders/18eOnNUaZbOZp7ddZ8ZldZrLEditSDKBt
+# Share this folder with your service account email (Editor) so it can write files.
+GOOGLE_DRIVE_RESULTS_FOLDER_ID = "18eOnNUaZbOZp7ddZ8ZldZrLEditSDKBt"
+
 # Backward-compat alias (used by any legacy code that still imports GOOGLE_SHEET_ID)
 GOOGLE_SHEET_ID = GOOGLE_SHEET_ID_INDIA
 
