@@ -187,8 +187,20 @@ def _json_default(obj):
 def _upload_to_drive(data: bytes, filename: str) -> str | None:
     """
     Upload bytes to the configured Google Drive folder.
-    Creates a new file or updates an existing file with the same name
-    (so re-running the same day overwrites rather than duplicates).
+
+    IMPORTANT: The target folder MUST be a Shared Drive (Team Drive).
+    Service accounts have zero personal storage quota and cannot create files
+    in regular "My Drive" folders — only in Shared Drives where they are a member.
+
+    Setup (one-time):
+      1. Google Drive → left sidebar → "Shared drives" → New → name it
+      2. Right-click the shared drive → Manage members
+      3. Add the service account email (client_email from credentials.json)
+         with "Contributor" role
+      4. Paste the shared drive or subfolder ID into GOOGLE_DRIVE_RESULTS_FOLDER_ID
+
+    The supportsAllDrives=True parameter is required for all Shared Drive API calls.
+    Re-running the same day updates the file in place — no duplicates.
 
     Returns the Drive file ID, or None on failure.
     """
@@ -210,33 +222,41 @@ def _upload_to_drive(data: bytes, filename: str) -> str | None:
     mime      = "application/json"
 
     try:
-        # Check if a file with this name already exists in the folder
+        # Search for existing file — supportsAllDrives + includeItemsFromAllDrives
+        # are required to find files inside Shared Drives.
         query = (
             f"name='{filename}' "
             f"and '{folder_id}' in parents "
             f"and mimeType='{mime}' "
             f"and trashed=false"
         )
-        existing = service.files().list(q=query, fields="files(id,name)").execute()
-        files    = existing.get("files", [])
+        existing = service.files().list(
+            q=query,
+            fields="files(id,name)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        files = existing.get("files", [])
 
         media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
 
         if files:
-            # Update in place — same URL, no duplicate
+            # Update in place — same file ID, no duplicate
             file_id = files[0]["id"]
             service.files().update(
                 fileId=file_id,
                 media_body=media,
+                supportsAllDrives=True,
             ).execute()
             logger.info(f"Drive: updated  '{filename}'  (id={file_id})")
         else:
-            # Create new file in folder
-            meta    = {"name": filename, "parents": [folder_id]}
-            result  = service.files().create(
+            # Create new file — supportsAllDrives=True required for Shared Drive parents
+            meta   = {"name": filename, "parents": [folder_id]}
+            result = service.files().create(
                 body=meta,
                 media_body=media,
                 fields="id",
+                supportsAllDrives=True,
             ).execute()
             file_id = result["id"]
             logger.info(f"Drive: created  '{filename}'  (id={file_id})")
