@@ -14,10 +14,17 @@ GOOGLE_SHEET_ID_INDIA = "1jXzBPKXXFWykibnK6KYHvPSDgCFJAScCDY0bI5EbV1c"  # India 
 GOOGLE_SHEET_ID_US    = "1UlHcYMW56Pv0P8YAj33N9wCMI6obs8VrzFwIqUFCjsc"  # US screener sheet
 GOOGLE_SHEET_ID_AI    = "1vqrDWPSFKtJhYqarrtfxNDCnnKSrc32J7ZN1mYPL-k8"  # AI Theme screener sheet
 
-# Google Drive folder — daily JSON exports are uploaded here after each run.
-# Folder URL: https://drive.google.com/drive/folders/18eOnNUaZbOZp7ddZ8ZldZrLEditSDKBt
-# Share this folder with your service account email (Editor) so it can write files.
-GOOGLE_DRIVE_RESULTS_FOLDER_ID = "18eOnNUaZbOZp7ddZ8ZldZrLEditSDKBt"
+# Local directory for JSON exports — written after every screener run.
+# Leave blank ("") to auto-detect: iCloud Drive → Dropbox → OneDrive → <project>/exports/
+# Examples:
+#   "~/Library/Mobile Documents/com~apple~CloudDocs/Screener Results"   (iCloud, custom path)
+#   "~/Dropbox/Screener Results"
+#   "~/OneDrive/Screener Results"
+LOCAL_JSON_OUTPUT_DIR = ""
+
+# DEPRECATED — Google Drive folder upload is replaced by local-sync approach above.
+# Service accounts have no personal Drive quota; Shared Drives require Google Workspace.
+# GOOGLE_DRIVE_RESULTS_FOLDER_ID = "1JB9HEhcF6OqW0J8e3feqAMYo9-NpzXA5"
 
 # Backward-compat alias (used by any legacy code that still imports GOOGLE_SHEET_ID)
 GOOGLE_SHEET_ID = GOOGLE_SHEET_ID_INDIA
