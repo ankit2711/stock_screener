@@ -13,6 +13,8 @@ env/
 
 # Credentials — NEVER commit
 credentials.json
+oauth_client.json
+token.json
 *.key
 *.pem
 

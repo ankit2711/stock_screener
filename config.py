@@ -14,17 +14,23 @@ GOOGLE_SHEET_ID_INDIA = "1jXzBPKXXFWykibnK6KYHvPSDgCFJAScCDY0bI5EbV1c"  # India 
 GOOGLE_SHEET_ID_US    = "1UlHcYMW56Pv0P8YAj33N9wCMI6obs8VrzFwIqUFCjsc"  # US screener sheet
 GOOGLE_SHEET_ID_AI    = "1vqrDWPSFKtJhYqarrtfxNDCnnKSrc32J7ZN1mYPL-k8"  # AI Theme screener sheet
 
-# Local directory for JSON exports — written after every screener run.
-# Leave blank ("") to auto-detect: iCloud Drive → Dropbox → OneDrive → <project>/exports/
-# Examples:
-#   "~/Library/Mobile Documents/com~apple~CloudDocs/Screener Results"   (iCloud, custom path)
-#   "~/Dropbox/Screener Results"
-#   "~/OneDrive/Screener Results"
-LOCAL_JSON_OUTPUT_DIR = ""
+# Google Drive — JSON export (OAuth2 user credentials, NOT service account)
+# -------------------------------------------------------------------------
+# ONE-TIME SETUP:
+#   1. Cloud Console → Credentials → Create → OAuth 2.0 Client ID → Desktop app
+#   2. Download JSON → save as the path below
+#   3. Enable "Google Drive API" in APIs & Services → Library
+#   4. First run: browser opens for consent → token.json saved automatically
+#
+# Get folder ID from the Drive URL:
+#   https://drive.google.com/drive/folders/<FOLDER_ID_HERE>
+#
+GOOGLE_OAUTH_CLIENT_FILE   = "oauth_client.json"   # OAuth2 Desktop credentials (not service account)
+GOOGLE_DRIVE_FOLDER_ID     = "18eOnNUaZbOZp7ddZ8ZldZrLEditSDKBt"  # target Drive folder
 
-# DEPRECATED — Google Drive folder upload is replaced by local-sync approach above.
-# Service accounts have no personal Drive quota; Shared Drives require Google Workspace.
-# GOOGLE_DRIVE_RESULTS_FOLDER_ID = "1JB9HEhcF6OqW0J8e3feqAMYo9-NpzXA5"
+# Local sync folder — used as fallback when Drive is not configured / offline.
+# Leave blank ("") to auto-detect: iCloud Drive → Dropbox → OneDrive → <project>/exports/
+LOCAL_JSON_OUTPUT_DIR = ""
 
 # Backward-compat alias (used by any legacy code that still imports GOOGLE_SHEET_ID)
 GOOGLE_SHEET_ID = GOOGLE_SHEET_ID_INDIA
