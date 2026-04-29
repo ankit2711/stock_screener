@@ -14,17 +14,29 @@
 #     "rs"     → top-30 RS Leaders (institutional holding during correction)
 #     "trade"  → top-15 unified trade candidates (Tier A + Tier B)
 #
-# TIER A — Trade Now:
-#   Active entry signal (BREAKOUT / AT_PIVOT / WEAK_BREAKOUT)
-#   Passes hard gates (stop ≤ 9%, pivot dist -8% to +5%)
-#   Weekly gate: weekly close must be > weekly EMA200 (W-S2 or W-S3 only)
-#     W-S1 Accum / W-S4 Decline → demoted to Tier B (price below weekly EMA)
-#   Score boost: +10 pts if weekly EMA200 slope is also rising (W-S2 ✓)
-#   Label: "W-Confirmed" (W-S2) | "W-Pending" (W-S3 or Unknown)
-#   Ranked by regime-aware unified score
+# TIER A — Trade Now  (two paths):
+#
+#   Path 1 — SEPA Entry (original):
+#     Active entry signal (BREAKOUT / AT_PIVOT / WEAK_BREAKOUT) from SEPA scan
+#     Passes hard gates (stop ≤ 9%, pivot dist -8% to +5%)
+#     Weekly gate: weekly close must be > weekly EMA200 (W-S2 or W-S3 only)
+#       W-S1 Accum / W-S4 Decline → demoted to Tier B (price below weekly EMA)
+#     Score boost: +10 pts if weekly EMA200 slope is also rising (W-S2 ✓)
+#     Label: "W-Confirmed" (W-S2) | "W-Pending" (W-S3 or Unknown)
+#
+#   Path 2 — Stage2 + RS Leader (no SEPA base required):
+#     Catches genuine movers that haven't formed a recognisable VCP base.
+#     A stock confirmed by BOTH Stage (Stage-2 quality) AND RS Leaders
+#     screeners, near its 20-bar pivot, with a tight stop and RSI < 80.
+#     SEPA component is replaced by redistributing its weight to Stage+RS
+#     proportionally, preserving regime-awareness.
+#     Entry/stop computed from OHLCV (20-bar high / recent swing low).
+#     Reason label: "Stage2 + RS Leader"
+#
+#   Both paths feed into the same MAX_TIER_A cap, ranked by unified score.
 #
 # TIER B — Watchlist:
-#   RS Leader score ≥ 45 AND Stage 2 AND no active SEPA entry
+#   RS Leader score ≥ 65 AND Stage 2 AND no active entry signal
 #   "Set price alert at pivot" — these are your post-FTD buys
 #
 # REGIME-AWARE WEIGHTS:
@@ -128,15 +140,26 @@ def run_trade_scan(
     sepa_map  = _df_to_map(sepa_df,  "Ticker")
     rs_map    = _df_to_map(rs_df,    "Ticker")
 
-    # ── Step 4: Build Tier A — active entries from SEPA that pass hard gates ──
+    # ── Step 4: Build Tier A — Path 1: SEPA entries ──────────────────────────
     tier_a = _build_tier_a(sepa_df, stage_map, rs_map, weights, regime_label, regime_mult)
-    logger.info(f"TRADE SCAN: Tier A (Trade Now) = {len(tier_a)} candidates")
+    logger.info(f"TRADE SCAN: Tier A Path1 (SEPA)         = {len(tier_a)} candidates")
+
+    # ── Step 4b: Tier A — Path 2: Stage2 + RS Leader (no SEPA base needed) ──
+    tier_a_tickers = {r["_ticker"] for r in tier_a}
+    tier_a_sr = _build_tier_a_stage_rs(
+        stage_df, rs_df, sepa_map, ohlcv,
+        weights, regime_label, regime_mult,
+        exclude=tier_a_tickers,
+    )
+    tier_a.extend(tier_a_sr)
+    logger.info(f"TRADE SCAN: Tier A Path2 (Stage2+RS)    = {len(tier_a_sr)} candidates")
+    logger.info(f"TRADE SCAN: Tier A total                = {len(tier_a)} candidates")
 
     # ── Step 5: Build Tier B — RS Leaders in Stage 2 waiting for FTD ─────────
-    tier_a_tickers = {r["_ticker"] for r in tier_a}
+    tier_a_tickers = {r["_ticker"] for r in tier_a}   # refresh after path 2
     tier_b = _build_tier_b(rs_df, stage_map, sepa_map, ohlcv, weights,
                            regime_label, exclude=tier_a_tickers, regime_mult=regime_mult)
-    logger.info(f"TRADE SCAN: Tier B (Watchlist)  = {len(tier_b)} candidates")
+    logger.info(f"TRADE SCAN: Tier B (Watchlist)          = {len(tier_b)} candidates")
 
     # ── Step 6: Holdings Alert — TheWrap signals for held positions only ────────
     # Loads Om-Holdings and scans ONLY those positions (fast — 40-60 stocks vs 1500+).
@@ -268,7 +291,7 @@ def _build_tier_a(sepa_df: pd.DataFrame, stage_map: dict, rs_map: dict,
         rs_norm   = rs_pts / 100.0
 
         state_norm = {"BREAKOUT": 1.0, "AT_PIVOT": 0.90, "WEAK_BREAKOUT": 0.55}.get(state, 0.3)
-        stop_norm  = max(0, (9.0 - stop_dist) / 6.0)
+        stop_norm  = min(max(0.0, (9.0 - stop_dist) / 6.0), 1.0)   # capped 0–1
 
         score = (
             sepa_norm  * weights["sepa"]  +
@@ -333,6 +356,202 @@ def _build_tier_a(sepa_df: pd.DataFrame, stage_map: dict, rs_map: dict,
 
 
 # =============================================================================
+# TIER A — PATH 2: STAGE2 + RS LEADER (no SEPA base required)
+# =============================================================================
+
+def _build_tier_a_stage_rs(
+    stage_df:    pd.DataFrame,
+    rs_df:       pd.DataFrame,
+    sepa_map:    dict,
+    ohlcv:       dict,
+    weights:     dict,
+    regime_label: str,
+    regime_mult:  float,
+    exclude:      set,
+) -> list:
+    """
+    Alternative Tier A path for genuine movers confirmed by Stage + RS but
+    without a completed SEPA VCP base.  A stock must appear in BOTH the Stage
+    screener output AND the RS Leaders output and be trading near its 20-bar
+    pivot with a manageable stop.
+
+    The SEPA weight is redistributed proportionally to Stage and RS so regime-
+    awareness is preserved — in a bear market RS still dominates.
+
+    Gates (any failure → skip):
+      • In Stage output AND RS output  (two-lens confirmation)
+      • RSI < 80                       (not already extended)
+      • Price within -8% to +5% of 20-bar pivot high
+      • Computed stop ≤ 9%             (position-sizeable)
+      • Weekly stage not W-S1 or W-S4 (if column present)
+      • TheWrap not TW_FADING / TW_EXIT* (if available via sepa_map)
+      • Not already in Tier A via SEPA  (exclude set)
+    """
+    if stage_df.empty or rs_df.empty:
+        return []
+
+    rs_map_local = _df_to_map(rs_df, "Ticker")
+    candidates   = []
+
+    # Redistribute sepa weight to stage+rs proportionally so weights still sum to 1
+    sepa_w   = weights["sepa"]
+    sr_total = weights["stage"] + weights["rs"]
+    w_stage  = weights["stage"] + sepa_w * (weights["stage"] / sr_total)
+    w_rs     = weights["rs"]    + sepa_w * (weights["rs"]    / sr_total)
+    w_state  = weights["state"]
+    w_stop   = weights["stop"]
+
+    for _, row in stage_df.iterrows():
+        ticker = str(row.get("Ticker", ""))
+
+        # ── Gate 1: must not already be a Tier A SEPA candidate ──────────────
+        if ticker in exclude:
+            continue
+
+        # ── Gate 2: must be confirmed by RS Leaders screener ─────────────────
+        rs_row = rs_map_local.get(ticker)
+        if not rs_row:
+            continue
+        rs_pts = float(rs_row.get("RS Score", 0))
+
+        # ── Gate 3: weekly stage — demote if price is below weekly EMA ───────
+        weekly_stage_str = str(row.get("Weekly Stage", "Unknown"))
+        if weekly_stage_str in ("W-S1 Accum", "W-S4 Decline"):
+            continue
+
+        # ── Gate 4: TheWrap — if available via sepa_map, apply exit gates ────
+        sepa_row = sepa_map.get(ticker, {})
+        tw_str   = str(sepa_row.get("TheWrap", "—"))
+        if any(x in tw_str for x in ("TW_FADING", "TW: Fading", "TW_EXIT", "TW: Exit")):
+            continue
+
+        # ── Gate 5: OHLCV price / pivot / stop ───────────────────────────────
+        raw_df = ohlcv.get(_restore_ticker(ticker, ohlcv), pd.DataFrame())
+        if raw_df.empty or len(raw_df) < 20:
+            continue
+
+        close    = float(raw_df["close"].iloc[-1])
+        high_20  = float(raw_df["high"].iloc[-20:].max())
+
+        # Pivot = just above the 20-bar consolidation high (buy-stop level)
+        pivot    = round(high_20 * 1.002, 2)
+
+        # Distance from pivot (negative = below pivot, i.e. approaching)
+        dist_pct = (close - high_20) / high_20 * 100
+
+        if dist_pct > _GATE["max_pivot_dist_pct"]:   # too extended past pivot
+            continue
+        if dist_pct < _GATE["min_pivot_dist_pct"]:   # too far below pivot
+            continue
+
+        # Determine entry state
+        if dist_pct > 0:
+            state = "BREAKOUT"
+            entry = round(close * 1.001, 2)   # buy at market (slight slippage)
+        elif dist_pct > -3.0:
+            state = "AT_PIVOT"
+            entry = pivot
+        else:
+            state = "WEAK_BREAKOUT"
+            entry = pivot
+
+        # Stop = recent 15-bar swing low; fall back to 8% below entry
+        low_15    = float(raw_df["low"].iloc[-15:].min())
+        stop_pct  = (entry - low_15) / entry * 100
+        if stop_pct > _GATE["max_stop_dist_pct"]:
+            low_15   = entry * 0.92       # fallback: 8% hard stop
+            stop_pct = 8.0
+        stop = round(low_15, 2)
+
+        if stop_pct > _GATE["max_stop_dist_pct"]:
+            continue
+
+        # ── Gate 6: RSI — skip if overbought ─────────────────────────────────
+        rsi = _quick_rsi(raw_df)
+        if rsi > 80:
+            continue
+
+        # ── Score ─────────────────────────────────────────────────────────────
+        s2_pts     = float(row.get("Stage Score S2", 0))
+        stage_norm = min(s2_pts / 10.0, 1.0)
+        rs_norm    = rs_pts / 100.0
+        state_norm = {"BREAKOUT": 1.0, "AT_PIVOT": 0.90, "WEAK_BREAKOUT": 0.55}[state]
+        stop_norm  = min(max(0.0, (9.0 - stop_pct) / 6.0), 1.0)   # capped 0–1
+
+        score = (
+            stage_norm * w_stage +
+            rs_norm    * w_rs    +
+            state_norm * w_state +
+            stop_norm  * w_stop
+        ) * 100
+
+        # Weekly and TheWrap boosts (same logic as SEPA path)
+        if weekly_stage_str == "W-S2 ✓":
+            score += 10.0
+        if any(x in tw_str for x in ("TW_BULLISH", "TW: Bullish")):
+            score += 8.0
+        elif any(x in tw_str for x in ("TW_MAINTAIN", "TW: Maintain")):
+            score += 5.0
+
+        # RSI extension haircut
+        if rsi > 75:
+            score *= 0.95
+
+        # ── RS leading signal ─────────────────────────────────────────────────
+        rs_leads_price = str(rs_row.get("RS Leads Price", ""))
+        rs_at_high     = str(rs_row.get("RS at 52w High", ""))
+        if rs_leads_price == "🌟 Leads":
+            rs_leading = "🌟 RS Leads"
+            score     += 6.0   # pre-breakout divergence — highest conviction
+        elif rs_at_high == "✓":
+            rs_leading = "✓"
+        else:
+            rs_leading = "·"
+
+        entry_signal = str(row.get("Entry Signal", ""))
+        setup_str    = f"RS Leader | Stage2{' | ' + entry_signal if entry_signal else ''}"
+
+        weekly_label = (
+            "W-Confirmed" if weekly_stage_str == "W-S2 ✓"
+            else "W-S3 Pending" if "W-S3" in weekly_stage_str
+            else "W-Pending"
+        )
+
+        candidates.append({
+            "_ticker":       ticker,
+            "_score":        round(score, 1),
+            "_tier":         "🟢 Trade Now",
+            "_reason":       "Stage2 + RS Leader",
+            "_state":        state,
+            "_sepa_raw":     0.0,
+            "_s2_pts":       round(s2_pts, 1),
+            "_rs_pts":       round(rs_pts, 1),
+            "_rsi":          round(rsi, 0),
+            "_stop_dist":    round(stop_pct, 1),
+            "_pivot_dist":   round(dist_pct, 1),
+            "_regime":       regime_label,
+            "_price":        round(close, 2),
+            "_entry":        entry,
+            "_stop":         stop,
+            "_company":      str(row.get("Company", ticker)),
+            "_sector":       str(row.get("Sector", "Unknown")),
+            "_tv":           str(row.get("TradingView", "")),
+            "_weekly_stage": weekly_stage_str,
+            "_weekly_label": weekly_label,
+            "_tw_label":     tw_str,
+            "_rs_leading":   rs_leading,
+            "_setup":        setup_str,
+            "_vcp":          0,
+            "_base_count":   0,
+            "_sepa_score":   0.0,
+            "_path":         "Stage2+RS",
+            "_regime_mult":  regime_mult,
+        })
+
+    return candidates
+
+
+# =============================================================================
 # TIER B — WATCHLIST (RS Leaders in Stage 2 awaiting FTD)
 # =============================================================================
 
@@ -353,8 +572,8 @@ def _build_tier_b(rs_df: pd.DataFrame, stage_map: dict, sepa_map: dict,
         rs_pts    = float(row.get("RS Score", 0))
         stage_str = str(row.get("Stage", ""))
 
-        # Must be RS Leader (score ≥ 45) and in Stage 2 structure
-        if rs_pts < 45:
+        # Must be RS Leader (score ≥ 65) and in Stage 2 structure
+        if rs_pts < 65:
             continue
         if "Stage 2" not in stage_str and "Stage 1" not in stage_str:
             continue
