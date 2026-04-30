@@ -25,13 +25,20 @@
 #     Label: "W-Confirmed" (W-S2) | "W-Pending" (W-S3 or Unknown)
 #
 #   Path 2 — Stage2 + RS Leader (no SEPA base required):
-#     Catches genuine movers that haven't formed a recognisable VCP base.
-#     A stock confirmed by BOTH Stage (Stage-2 quality) AND RS Leaders
-#     screeners, near its 20-bar pivot, with a tight stop and RSI < 80.
-#     SEPA component is replaced by redistributing its weight to Stage+RS
-#     proportionally, preserving regime-awareness.
-#     Entry/stop computed from OHLCV (20-bar high / recent swing low).
-#     Reason label: "Stage2 + RS Leader"
+#     Catches genuine movers that SEPA misses. SEPA routes trending stocks to
+#     "C: Trending (No Setup)" with score=2.0 because detect_base() fails when
+#     the highest high is very recent — they never make SEPA top-30 and are
+#     absent from sepa_df entirely.
+#
+#     Two sub-paths:
+#       Cheat Entry  (Entry Signal = "🟢 Cheat Entry" in Stage output):
+#         Running leader pulling back to EMA21. Entry = current price,
+#         Stop = EMA21 × 0.97 (3% tight structural stop). No RSI gate.
+#         No 20-bar high dist gate. Score bonus: +12 pts.
+#       Standard Stage2+RS:
+#         Confirmed by Stage + RS, near 20-bar breakout high.
+#         Stop = EMA21 × 0.97. RSI hard gate raised to >85 (was >80).
+#     Reason label: "Stage2 + RS Leader" / "Stage2 + RS Leader (Cheat)"
 #
 #   Both paths feed into the same MAX_TIER_A cap, ranked by unified score.
 #
@@ -370,22 +377,38 @@ def _build_tier_a_stage_rs(
     exclude:      set,
 ) -> list:
     """
-    Alternative Tier A path for genuine movers confirmed by Stage + RS but
-    without a completed SEPA VCP base.  A stock must appear in BOTH the Stage
-    screener output AND the RS Leaders output and be trading near its 20-bar
-    pivot with a manageable stop.
+    Tier A path 2 — catches genuine running leaders that SEPA misses.
 
-    The SEPA weight is redistributed proportionally to Stage and RS so regime-
-    awareness is preserved — in a bear market RS still dominates.
+    WHY SEPA MISSES RUNNING STOCKS:
+      sepa.py routes trending stocks to "C: Trending (No Setup)" with score=2.0
+      because detect_base() fails when the highest high is very recent (pivot too
+      recent → base_length < min_bars).  They never make the SEPA top-30 and are
+      therefore absent from sepa_df entirely — invisible to Tier A Path 1.
 
-    Gates (any failure → skip):
-      • In Stage output AND RS output  (two-lens confirmation)
-      • RSI < 80                       (not already extended)
-      • Price within -8% to +5% of 20-bar pivot high
-      • Computed stop ≤ 9%             (position-sizeable)
-      • Weekly stage not W-S1 or W-S4 (if column present)
-      • TheWrap not TW_FADING / TW_EXIT* (if available via sepa_map)
-      • Not already in Tier A via SEPA  (exclude set)
+    TWO SUB-PATHS:
+
+      Cheat Entry  (🟢 Cheat Entry in stage_df "Entry Signal"):
+        Stock is an established Stage 2 leader pulling back to its EMA21.
+        This is Minervini's highest-conviction follow-on entry on a proven winner.
+        • Entry  = current price (buy the EMA21 test)
+        • Stop   = EMA21 × 0.97  (3% below the MA being tested — tight structural)
+        • RSI gate is REMOVED — RSI after a pullback is typically 50–70, irrelevant
+        • dist_pct gate vs 20-bar high is BYPASSED — the relevant reference is EMA21
+        • Score bonus: +12 pts (highest-conviction running-leader entry)
+
+      Standard Stage2+RS  (no cheat entry):
+        Stock confirmed by both Stage and RS Leaders screeners, trading near its
+        20-bar breakout high with a position-sizeable stop.
+        • Stop computed from EMA21 × 0.97 (structural stop, tighter than 15-bar low)
+        • RSI hard gate raised to > 85 (was 80); penalty applied at 78–85
+        • Covers: at-pivot breakouts and new-high momentum stocks
+
+    SHARED GATES (both sub-paths):
+      • In Stage output AND RS output        (two-lens confirmation)
+      • Weekly stage not W-S1 or W-S4        (price above weekly EMA)
+      • TheWrap not TW_FADING / TW_EXIT*     (structure not compromised)
+      • Not already in Tier A via SEPA        (exclude set)
+      • Stop ≤ 9%                             (position-sizeable)
     """
     if stage_df.empty or rs_df.empty:
         return []
@@ -419,56 +442,82 @@ def _build_tier_a_stage_rs(
         if weekly_stage_str in ("W-S1 Accum", "W-S4 Decline"):
             continue
 
-        # ── Gate 4: TheWrap — if available via sepa_map, apply exit gates ────
+        # ── Gate 4: TheWrap exit gates ────────────────────────────────────────
         sepa_row = sepa_map.get(ticker, {})
         tw_str   = str(sepa_row.get("TheWrap", "—"))
         if any(x in tw_str for x in ("TW_FADING", "TW: Fading", "TW_EXIT", "TW: Exit")):
             continue
 
-        # ── Gate 5: OHLCV price / pivot / stop ───────────────────────────────
+        # ── Gate 5: OHLCV ─────────────────────────────────────────────────────
         raw_df = ohlcv.get(_restore_ticker(ticker, ohlcv), pd.DataFrame())
-        if raw_df.empty or len(raw_df) < 20:
+        if raw_df.empty or len(raw_df) < 30:
             continue
 
-        close    = float(raw_df["close"].iloc[-1])
-        high_20  = float(raw_df["high"].iloc[-20:].max())
+        close        = float(raw_df["close"].iloc[-1])
+        close_series = raw_df["close"]
+        rsi          = _quick_rsi(raw_df)
 
-        # Pivot = just above the 20-bar consolidation high (buy-stop level)
-        pivot    = round(high_20 * 1.002, 2)
+        # EMA21 — structural reference for both cheat entry and stop
+        ema21 = float(close_series.ewm(span=21, adjust=False).mean().iloc[-1])
 
-        # Distance from pivot (negative = below pivot, i.e. approaching)
-        dist_pct = (close - high_20) / high_20 * 100
+        # ── Detect which sub-path applies ─────────────────────────────────────
+        entry_signal = str(row.get("Entry Signal", ""))
+        is_cheat     = "Cheat Entry" in entry_signal
 
-        if dist_pct > _GATE["max_pivot_dist_pct"]:   # too extended past pivot
-            continue
-        if dist_pct < _GATE["min_pivot_dist_pct"]:   # too far below pivot
-            continue
+        if is_cheat:
+            # ══════════════════════════════════════════════════════════════════
+            # SUB-PATH A: Cheat Entry — running leader at EMA21 pullback
+            # ══════════════════════════════════════════════════════════════════
+            # The stage ranker already confirmed: price within 2.5% of EMA21
+            # AND volume drying up.  No additional distance gate needed here.
+            # EMA21 IS the pivot in this context, not the 20-bar high.
+            # ══════════════════════════════════════════════════════════════════
+            state    = "AT_PIVOT"
+            entry    = round(close * 1.001, 2)       # buy at market / EMA21 test
+            stop     = round(ema21 * 0.97, 2)        # 3% below EMA21 — tight structural
+            stop_pct = max(0.5, (entry - stop) / entry * 100)
+            dist_pct = (close - ema21) / ema21 * 100  # distance from EMA21
 
-        # Determine entry state
-        if dist_pct > 0:
-            state = "BREAKOUT"
-            entry = round(close * 1.001, 2)   # buy at market (slight slippage)
-        elif dist_pct > -3.0:
-            state = "AT_PIVOT"
-            entry = pivot
+            # No RSI gate for cheat entries — pullback naturally resets RSI to 50–70
+            # (if RSI is still 85+ during a pullback, it's a shallow one = bullish)
+
         else:
-            state = "WEAK_BREAKOUT"
-            entry = pivot
+            # ══════════════════════════════════════════════════════════════════
+            # SUB-PATH B: Standard Stage2+RS — at 20-bar breakout high
+            # ══════════════════════════════════════════════════════════════════
+            high_20  = float(raw_df["high"].iloc[-20:].max())
+            dist_pct = (close - high_20) / high_20 * 100
 
-        # Stop = recent 15-bar swing low; fall back to 8% below entry
-        low_15    = float(raw_df["low"].iloc[-15:].min())
-        stop_pct  = (entry - low_15) / entry * 100
+            if dist_pct > _GATE["max_pivot_dist_pct"]:    # too extended past pivot
+                continue
+            if dist_pct < _GATE["min_pivot_dist_pct"]:    # too far below pivot
+                continue
+
+            if dist_pct > 0:
+                state = "BREAKOUT"
+                entry = round(close * 1.001, 2)
+            elif dist_pct > -3.0:
+                state = "AT_PIVOT"
+                entry = round(high_20 * 1.002, 2)
+            else:
+                state = "WEAK_BREAKOUT"
+                entry = round(high_20 * 1.002, 2)
+
+            # Stop: EMA21 × 0.97 is a cleaner structural stop than 15-bar swing low
+            # (the 15-bar low picks up normal market noise; EMA21 is a deliberate MA)
+            stop     = round(ema21 * 0.97, 2)
+            stop_pct = (entry - stop) / entry * 100
+            if stop_pct > _GATE["max_stop_dist_pct"]:
+                stop     = round(entry * 0.92, 2)
+                stop_pct = 8.0
+
+            # RSI gate — hard exclude only at extreme overbought (>85)
+            # At 78–85: apply score penalty below (not a hard exclude)
+            if rsi > 85:
+                continue
+
+        # ── Shared stop gate ──────────────────────────────────────────────────
         if stop_pct > _GATE["max_stop_dist_pct"]:
-            low_15   = entry * 0.92       # fallback: 8% hard stop
-            stop_pct = 8.0
-        stop = round(low_15, 2)
-
-        if stop_pct > _GATE["max_stop_dist_pct"]:
-            continue
-
-        # ── Gate 6: RSI — skip if overbought ─────────────────────────────────
-        rsi = _quick_rsi(raw_df)
-        if rsi > 80:
             continue
 
         # ── Score ─────────────────────────────────────────────────────────────
@@ -476,7 +525,7 @@ def _build_tier_a_stage_rs(
         stage_norm = min(s2_pts / 10.0, 1.0)
         rs_norm    = rs_pts / 100.0
         state_norm = {"BREAKOUT": 1.0, "AT_PIVOT": 0.90, "WEAK_BREAKOUT": 0.55}[state]
-        stop_norm  = min(max(0.0, (9.0 - stop_pct) / 6.0), 1.0)   # capped 0–1
+        stop_norm  = min(max(0.0, (9.0 - stop_pct) / 6.0), 1.0)
 
         score = (
             stage_norm * w_stage +
@@ -485,7 +534,11 @@ def _build_tier_a_stage_rs(
             stop_norm  * w_stop
         ) * 100
 
-        # Weekly and TheWrap boosts (same logic as SEPA path)
+        # Cheat entry bonus — highest-conviction running-leader signal
+        if is_cheat:
+            score += 12.0
+
+        # Weekly and TheWrap boosts
         if weekly_stage_str == "W-S2 ✓":
             score += 10.0
         if any(x in tw_str for x in ("TW_BULLISH", "TW: Bullish")):
@@ -493,23 +546,27 @@ def _build_tier_a_stage_rs(
         elif any(x in tw_str for x in ("TW_MAINTAIN", "TW: Maintain")):
             score += 5.0
 
-        # RSI extension haircut
-        if rsi > 75:
-            score *= 0.95
+        # RSI penalties (graduated — not hard excludes for cheat entries)
+        if rsi > 85:
+            score *= 0.85
+        elif rsi > 78:
+            score *= 0.93
 
         # ── RS leading signal ─────────────────────────────────────────────────
         rs_leads_price = str(rs_row.get("RS Leads Price", ""))
         rs_at_high     = str(rs_row.get("RS at 52w High", ""))
         if rs_leads_price == "🌟 Leads":
             rs_leading = "🌟 RS Leads"
-            score     += 6.0   # pre-breakout divergence — highest conviction
+            score     += 6.0
         elif rs_at_high == "✓":
             rs_leading = "✓"
         else:
             rs_leading = "·"
 
-        entry_signal = str(row.get("Entry Signal", ""))
-        setup_str    = f"RS Leader | Stage2{' | ' + entry_signal if entry_signal else ''}"
+        # ── Reason and setup string ───────────────────────────────────────────
+        reason    = "Stage2 + RS Leader (Cheat)" if is_cheat else "Stage2 + RS Leader"
+        setup_str = entry_signal if is_cheat else f"RS Leader | Stage2 | {entry_signal}"
+        path_str  = "Stage2+RS+Cheat" if is_cheat else "Stage2+RS"
 
         weekly_label = (
             "W-Confirmed" if weekly_stage_str == "W-S2 ✓"
@@ -521,7 +578,7 @@ def _build_tier_a_stage_rs(
             "_ticker":       ticker,
             "_score":        round(score, 1),
             "_tier":         "🟢 Trade Now",
-            "_reason":       "Stage2 + RS Leader",
+            "_reason":       reason,
             "_state":        state,
             "_sepa_raw":     0.0,
             "_s2_pts":       round(s2_pts, 1),
@@ -544,7 +601,7 @@ def _build_tier_a_stage_rs(
             "_vcp":          0,
             "_base_count":   0,
             "_sepa_score":   0.0,
-            "_path":         "Stage2+RS",
+            "_path":         path_str,
             "_regime_mult":  regime_mult,
         })
 
