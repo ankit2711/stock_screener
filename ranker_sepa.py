@@ -28,6 +28,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
+from first_seen import annotate_df
 from screeners.stage_analysis import StageAnalysisConfig, run_stage_analysis
 from screeners.sepa import SEPAConfig, SEPAResult, run_sepa_analysis
 from screeners.weekly_stage import (
@@ -201,12 +202,14 @@ def run_screens_sepa(
             weekly_stage     = w_stage   # int: 0=unknown 1=S1 2=S2 3=S3 4=S4
 
             # ── Step 4b: TheWrap signal (weekly 10W/20W/40W EMA) ─────────────
-            # Hard gate: TW_EXIT and TW_EXIT_40W are excluded from SEPA output.
-            # These stocks have broken structural support — no valid entry exists.
-            # TW_CAUTIOUS is also excluded: price below 10W/20W EMA = not a setup.
+            # Hard gate: TW_EXIT / TW_EXIT_40W — price broke below 40W EMA with
+            # slope rolling over. Structural break — no valid entry exists.
+            # TW_CAUTIOUS (below 10W/20W but 40W still rising/flat): NOT a hard
+            # exclude. Many fresh Stage 2 entries start from TW_CAUTIOUS territory.
+            # A score penalty (–8 pts) is applied in Step 5b instead.
             tw_code, tw_label, _, _, _ = compute_thewrap_signal(weekly_df)
-            if tw_code in ("TW_EXIT", "TW_EXIT_40W", "TW_CAUTIOUS"):
-                continue   # structure compromised — not a buy
+            if tw_code in ("TW_EXIT", "TW_EXIT_40W"):
+                continue   # structural break below 40W EMA — no valid entry
 
             # ── Step 5: SEPA scoring ──────────────────────────────────────────
             sepa_result = run_sepa_analysis(
@@ -231,7 +234,7 @@ def run_screens_sepa(
             # Store tw_code on result for trade ranker Tier A gate
             sepa_result.tw_code  = tw_code
             sepa_result.tw_label = tw_label
-            tw_adj = {"TW_BULLISH": 15, "TW_MAINTAIN": 8, "TW_WAIT": 0, "TW_FADING": -10}.get(tw_code, 0)
+            tw_adj = {"TW_BULLISH": 15, "TW_MAINTAIN": 8, "TW_WAIT": 0, "TW_FADING": -10, "TW_CAUTIOUS": -8}.get(tw_code, 0)
             if tw_adj != 0:
                 sepa_result.sepa_score = max(0.0, sepa_result.sepa_score + tw_adj)
                 sepa_result.score      = sepa_result.sepa_score  # keep in sync
@@ -250,7 +253,7 @@ def run_screens_sepa(
     df_out = pd.DataFrame(rows)
     df_out = df_out.sort_values("SEPA Score", ascending=False).reset_index(drop=True)
     df_out.insert(0, "Rank", range(1, len(df_out) + 1))
-    return df_out.head(top_n)
+    return annotate_df(df_out.head(top_n), "sepa")
 
 
 # =============================================================================
@@ -646,6 +649,18 @@ def _result_to_row(r: SEPAResult, meta: dict, raw_ticker: str, regime_label: str
         "S1 Base CV%":    f"{r.s1_cv_pct:.1f}%" if is_path_a else "—",
         "Extension %":    f"{r.extension_pct:+.1f}%" if is_path_a else "—",
 
+        # ── 11b. MINERVINI PATTERN SIGNALS ───────────────────────────────
+        # Pocket Pivot (both paths): today is an up day whose volume exceeds
+        #   the highest volume of any DOWN day in the prior 10 sessions.
+        #   ✓ = institutional accumulation on this exact bar — highest conviction buy.
+        # Tight Closes (Path B): longest streak of consecutive bars closing
+        #   within 1% of each other. 3+ = controlled accumulation; 5+ = coiling.
+        # Time Compressed (Path B): VCP last contraction is shorter in time
+        #   than the prior one — price AND time both compressing. ✓ = spring loaded.
+        "Pocket Pivot":   "✓" if r.pocket_pivot else "·",
+        "Tight Closes":   r.tight_close_max if not is_path_a else "—",
+        "Time Compress":  ("✓" if r.time_compressed else "·") if not is_path_a else "—",
+
         # ════════════════════════════════════════════════════════════════════
         # CONTEXT / RESEARCH — read when sizing, comparing, or curious
         # ════════════════════════════════════════════════════════════════════
@@ -687,8 +702,8 @@ def _result_to_row(r: SEPAResult, meta: dict, raw_ticker: str, regime_label: str
 
 def _fmt_dollar_vol(adv: float) -> str:
     if adv >= 1e9: return f"${adv / 1e9:.2f}B"
+    if adv >= 1e7: return f"₹{adv / 1e7:.2f}Cr"   # Indian crore — must precede $M check
     if adv >= 1e6: return f"${adv / 1e6:.2f}M"
-    if adv >= 1e7: return f"₹{adv / 1e7:.2f}Cr"
     return f"${adv:,.0f}"
 
 

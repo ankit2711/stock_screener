@@ -307,6 +307,7 @@ def _build_payload(
         rs_df       = results.get("rs",             pd.DataFrame())
         trade_df    = results.get("trade",          pd.DataFrame())
         holdings_df = results.get("holdings_alert", pd.DataFrame())
+        sector_res  = results.get("sectors",        {})
 
         base["summary"] = {
             "stage":          len(stage_df),
@@ -314,12 +315,22 @@ def _build_payload(
             "rs":             len(rs_df),
             "trade":          len(trade_df),
             "holdings_alert": len(holdings_df),
+            "sectors":        len(sector_res),
         }
         base["stage"]          = _df_to_records(stage_df)
         base["sepa"]           = _df_to_records(sepa_df)
         base["rs"]             = _df_to_records(rs_df)
         base["trade"]          = _df_to_records(trade_df)
         base["holdings_alert"] = _df_to_records(holdings_df)
+
+        # Sector rotation results — serialise only if present
+        if sector_res:
+            try:
+                from ranker_sector import sector_results_to_json
+                base["sectors"] = sector_results_to_json(sector_res)
+            except Exception as _se:
+                logger.debug(f"Sector JSON serialisation skipped: {_se}")
+                base["sectors"] = {}
 
     elif isinstance(results, pd.DataFrame):
         base["summary"] = {"total": len(results)}

@@ -179,11 +179,13 @@ def get_missing_date_range(ticker: str, history_days: int,
     if last_cached is None:
         # No cache — fetch full history
         return full_start, today
-    elif last_cached >= today - timedelta(days=1):
-        # Already up to date (yesterday or today)
+    elif last_cached >= today:
+        # Today's bar already cached (e.g. script run twice in one day)
         return None, None
     else:
-        # Fetch from day after last cached to today
+        # Cache has up to last_cached — fetch everything after that up to today.
+        # This correctly picks up today's close when run after market hours,
+        # regardless of whether yesterday was a trading day or a holiday.
         fetch_start = last_cached + timedelta(days=1)
         return fetch_start, today
 

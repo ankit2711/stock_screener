@@ -33,6 +33,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
+from first_seen import annotate_df
 from screeners.stage_analysis import (
     StageAnalysisConfig, StageAnalysisResult, run_stage_analysis
 )
@@ -201,7 +202,7 @@ def run_screens_stage(
     df_out = pd.DataFrame(rows)
     df_out = df_out.sort_values("Score", ascending=False).reset_index(drop=True)
     df_out.insert(0, "Rank", range(1, len(df_out) + 1))
-    return df_out.head(top_n)
+    return annotate_df(df_out.head(top_n), "stage")
 
 
 # =============================================================================
@@ -557,8 +558,8 @@ def _result_to_row(
 
 def _fmt_dollar_vol(adv: float) -> str:
     if adv >= 1e9:  return f"${adv / 1e9:.2f}B"
+    if adv >= 1e7:  return f"₹{adv / 1e7:.2f}Cr"   # Indian crore — must precede $M check
     if adv >= 1e6:  return f"${adv / 1e6:.2f}M"
-    if adv >= 1e7:  return f"₹{adv / 1e7:.2f}Cr"
     return f"${adv:,.0f}"
 
 

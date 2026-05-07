@@ -33,6 +33,7 @@ import logging
 import pandas as pd
 from datetime import datetime
 
+from first_seen import annotate_df
 from screeners.rs_leaders import RSLeaderResult, run_rs_leaders_analysis
 from config import (
     TOP_N_RS_INDIA, TOP_N_RS_US,
@@ -162,7 +163,7 @@ def run_screens_rs(
         .reset_index(drop=True)
     )
     df_out.insert(0, "Rank", range(1, len(df_out) + 1))
-    return df_out.head(top_n)
+    return annotate_df(df_out.head(top_n), "rs")
 
 
 # =============================================================================
@@ -274,8 +275,8 @@ def _bench_regime_label(pct_off: float) -> str:
 
 def _fmt_dollar_vol(adv: float) -> str:
     if adv >= 1e9:   return f"${adv / 1e9:.2f}B"
+    if adv >= 1e7:   return f"₹{adv / 1e7:.2f}Cr"   # Indian crore — must precede $M check
     if adv >= 1e6:   return f"${adv / 1e6:.2f}M"
-    if adv >= 1e7:   return f"₹{adv / 1e7:.2f}Cr"
     return f"${adv:,.0f}"
 
 

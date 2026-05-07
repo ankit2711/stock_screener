@@ -64,11 +64,21 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
+from first_seen import annotate_df
 from screeners.stage_analysis import StageAnalysisConfig
-from screeners.sepa import SEPAConfig
-from ranker_sepa  import run_screens_sepa, get_market_regime, _STAGE_CFG as SEPA_STAGE_CFG, _SEPA_CFG
-from ranker_stage import run_screens_stage, DEFAULT_CFG as STAGE_CFG
-from ranker_rs    import run_screens_rs
+from screeners.sepa import SEPAConfig, detect_base
+from screeners.sector_rotation import (
+    run_sector_rotation,
+    get_sector_for_ticker,
+    get_regime_from_sectors,
+    SectorResult,
+)
+from ranker_sepa       import run_screens_sepa, get_market_regime, _STAGE_CFG as SEPA_STAGE_CFG, _SEPA_CFG
+from ranker_stage      import run_screens_stage, DEFAULT_CFG as STAGE_CFG
+from ranker_rs         import run_screens_rs
+from ranker_conviction import run_conviction_scan
+from data_quality      import run_data_quality_scan
+from persistence       import append_screener_exits
 
 logger = logging.getLogger(__name__)
 
@@ -92,10 +102,10 @@ _REGIME_WEIGHTS = {
 
 # Hard gate thresholds — any failure eliminates Tier A candidates
 _GATE = {
-    "allowed_states":     {"BREAKOUT", "AT_PIVOT", "WEAK_BREAKOUT"},
+    "allowed_states":     {"BREAKOUT", "AT_PIVOT", "WEAK_BREAKOUT", "IN_BASE"},
     "max_pivot_dist_pct":  5.0,
-    "min_pivot_dist_pct": -8.0,
-    "max_stop_dist_pct":   9.0,
+    "min_pivot_dist_pct": -8.0,   # IN_BASE stocks >8% below pivot → Tier B only
+    "max_stop_dist_pct":  11.0,   # raised from 9% — valid VCP bases can have wider stops
 }
 
 
@@ -124,6 +134,28 @@ def run_trade_scan(
     logger.info(f"TRADE SCAN: Regime={regime_label} (×{regime_mult:.2f}) "
                 f"→ RS weight={weights['rs']:.0%}, SEPA weight={weights['sepa']:.0%}")
 
+    # ── Step 1b: Sector Rotation ──────────────────────────────────────────────
+    # Run before the 3 scans so sector multipliers are ready when scoring starts.
+    # Graceful: if sector rotation fails for any reason, sector_results = {}
+    # and all multipliers default to 1.0 (no impact on existing behaviour).
+    logger.info("TRADE SCAN: Running Sector Rotation scan...")
+    sector_results: dict[str, SectorResult] = {}
+    try:
+        sector_results = run_sector_rotation(ohlcv, metadata, benchmark, market=market)
+        sector_regime, _ = get_regime_from_sectors(sector_results)
+        lead_n  = sum(1 for r in sector_results.values() if r.sector_label in ("LEADING", "IMPROVING"))
+        lag_n   = sum(1 for r in sector_results.values() if r.sector_label in ("WEAKENING", "LAGGING"))
+        logger.info(f"TRADE SCAN: Sectors={len(sector_results)} "
+                    f"(Leading/Improving={lead_n}, Weakening/Lagging={lag_n}) "
+                    f"→ {sector_regime}")
+    except Exception as _se:
+        import traceback
+        logger.warning(
+            f"TRADE SCAN: Sector rotation failed (non-fatal) — "
+            f"sector tabs will show 'No data'. Error: {_se}\n"
+            + traceback.format_exc()
+        )
+
     # ── Step 2: Run all 3 scans ───────────────────────────────────────────────
     logger.info("TRADE SCAN: Running Stage scan...")
     stage_df = _safe_run(run_screens_stage,
@@ -148,7 +180,10 @@ def run_trade_scan(
     rs_map    = _df_to_map(rs_df,    "Ticker")
 
     # ── Step 4: Build Tier A — Path 1: SEPA entries ──────────────────────────
-    tier_a = _build_tier_a(sepa_df, stage_map, rs_map, weights, regime_label, regime_mult)
+    tier_a = _build_tier_a(
+        sepa_df, stage_map, rs_map, weights, regime_label, regime_mult,
+        sector_results=sector_results, metadata=metadata, market=market,
+    )
     logger.info(f"TRADE SCAN: Tier A Path1 (SEPA)         = {len(tier_a)} candidates")
 
     # ── Step 4b: Tier A — Path 2: Stage2 + RS Leader (no SEPA base needed) ──
@@ -157,6 +192,7 @@ def run_trade_scan(
         stage_df, rs_df, sepa_map, ohlcv,
         weights, regime_label, regime_mult,
         exclude=tier_a_tickers,
+        sector_results=sector_results, metadata=metadata, market=market,
     )
     tier_a.extend(tier_a_sr)
     logger.info(f"TRADE SCAN: Tier A Path2 (Stage2+RS)    = {len(tier_a_sr)} candidates")
@@ -165,8 +201,22 @@ def run_trade_scan(
     # ── Step 5: Build Tier B — RS Leaders in Stage 2 waiting for FTD ─────────
     tier_a_tickers = {r["_ticker"] for r in tier_a}   # refresh after path 2
     tier_b = _build_tier_b(rs_df, stage_map, sepa_map, ohlcv, weights,
-                           regime_label, exclude=tier_a_tickers, regime_mult=regime_mult)
+                           regime_label, exclude=tier_a_tickers, regime_mult=regime_mult,
+                           sector_results=sector_results, metadata=metadata, market=market)
     logger.info(f"TRADE SCAN: Tier B (Watchlist)          = {len(tier_b)} candidates")
+
+    # ── Step 5b: Tier B supplement — Stage2 fast movers not in RS Leaders ─────
+    # Catches stocks that just broke into Stage2 and are running but haven't
+    # built enough RS history (13–26 weeks) to qualify for the RS Leaders list.
+    # Without this step, these stocks are invisible in ALL candidate paths.
+    all_tier_ab_tickers = {r["_ticker"] for r in tier_a} | {r["_ticker"] for r in tier_b}
+    tier_b_stage = _build_tier_b_stage(
+        stage_df, exclude=all_tier_ab_tickers,
+        weights=weights, regime_label=regime_label, regime_mult=regime_mult,
+        sector_results=sector_results, metadata=metadata, market=market,
+    )
+    tier_b.extend(tier_b_stage)
+    logger.info(f"TRADE SCAN: Tier B Momentum supplement  = {len(tier_b_stage)} candidates")
 
     # ── Step 6: Holdings Alert — TheWrap signals for held positions only ────────
     # Loads Om-Holdings and scans ONLY those positions (fast — 40-60 stocks vs 1500+).
@@ -202,15 +252,69 @@ def run_trade_scan(
         sorted(tier_b, key=lambda r: r["_score"], reverse=True)[:MAX_TIER_B]
     )
     trade_df = _build_trade_output(all_candidates, market, regime_mult)
+    trade_df = annotate_df(trade_df, "trade")
 
     logger.info(f"TRADE SCAN ✓ Returning {len(trade_df)} trade candidates")
+
+    # ── Step 8: Daily BUY Conviction — 3 signals on full universe ────────────
+    # Computes Stage2 / RS / SEPA signals on EVERY stock (not just screener top-30).
+    # Top-20 by conviction score with streak tracking.
+    logger.info("TRADE SCAN: Running Daily BUY Conviction scan...")
+    conviction_df = pd.DataFrame()
+    try:
+        conviction_df = run_conviction_scan(
+            ohlcv     = ohlcv,
+            metadata  = metadata,
+            benchmark = benchmark,
+            market    = market,
+            stage_df  = stage_df,   # optional — for RS Signal / Weekly Stage enrichment
+            sepa_df   = sepa_df,
+            rs_df     = rs_df,
+        )
+        n3 = int((conviction_df["# Signals"] == 3).sum()) if not conviction_df.empty else 0
+        logger.info(
+            f"TRADE SCAN: Daily BUY Conviction = {len(conviction_df)} stocks "
+            f"({n3} triple-signal)"
+            if not conviction_df.empty else "TRADE SCAN: Daily BUY Conviction = 0 stocks"
+        )
+    except Exception as _ce:
+        import traceback
+        logger.warning(
+            f"TRADE SCAN: Conviction scan failed (non-fatal): {_ce}\n"
+            + traceback.format_exc()
+        )
+
+    # ── Step 9: Data Quality — flag tickers with NaN price/volume or stale data ─
+    logger.info("TRADE SCAN: Running Data Quality scan...")
+    data_quality_df = pd.DataFrame()
+    try:
+        data_quality_df = run_data_quality_scan(ohlcv, metadata, market=market)
+        logger.info(f"TRADE SCAN: Data Issues = {len(data_quality_df)} bad tickers")
+    except Exception as _dqe:
+        logger.warning(f"TRADE SCAN: Data Quality scan failed (non-fatal): {_dqe}")
+
+    # ── Step 10: Append 14-day exit history to screener tabs ─────────────────
+    # Stocks that drop out of each screener are kept at the bottom for 14 days
+    # with an "Exit Date" column showing when they left. The tabs are fixed (no
+    # daily dated tabs) so this provides rolling history without tab proliferation.
+    logger.info("TRADE SCAN: Appending 14-day exit history to screener tabs...")
+    try:
+        stage_df  = append_screener_exits(stage_df,  bucket=f"stage_{market}")
+        sepa_df   = append_screener_exits(sepa_df,   bucket=f"sepa_{market}")
+        rs_df     = append_screener_exits(rs_df,     bucket=f"rs_{market}")
+        trade_df  = append_screener_exits(trade_df,  bucket=f"trade_{market}")
+    except Exception as _ee:
+        logger.warning(f"TRADE SCAN: Exit history append failed (non-fatal): {_ee}")
 
     return {
         "stage":          stage_df,
         "sepa":           sepa_df,
         "rs":             rs_df,
         "trade":          trade_df,
-        "holdings_alert": holdings_alert_df,   # only tab written for exit monitoring
+        "holdings_alert": holdings_alert_df,
+        "sectors":        sector_results,      # dict[str, SectorResult] — for display + JSON export
+        "conviction":     conviction_df,       # Daily BUY — 2+ signal stocks with streak
+        "data_quality":   data_quality_df,     # Data Issues — NaN / stale / spike tickers
     }
 
 
@@ -218,14 +322,65 @@ def run_trade_scan(
 # TIER A — ACTIVE ENTRY CANDIDATES (from SEPA)
 # =============================================================================
 
+def _sort_sepa_for_trade(sepa_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Re-prioritize SEPA output for trade use: actionable (near-pivot) stocks first.
+
+    WHY THIS IS NEEDED:
+      SEPA sorts by base quality (VCP, RS, vol dry-up). A deep-in-base stock with a
+      perfect VCP scores 95 and ranks #1. An AT_PIVOT stock with an average VCP scores
+      45 and ranks #25 or falls off the top-30 entirely. The trade ranker's pivot-
+      distance gate then rejects the perfect-VCP deep-in-base stock, and the AT_PIVOT
+      stock was never seen. Result: Tier A Path 1 produces nothing.
+
+      This sort puts actionable stocks first so the trade ranker sees them regardless
+      of where they ranked in the base-quality sort. Within each tier, SEPA Score is
+      still the tiebreaker so better setups rank ahead of weaker ones.
+
+    Tiers (ascending sort key → lower = higher priority):
+      0  BREAKOUT / AT_PIVOT / WEAK_BREAKOUT within −5% to +5% of pivot — enter today
+      1  IN_BASE within −8% to −5% of pivot — near entry, set alert
+      2  Everything else (deep in base, extended, trending) — rarely qualify
+    """
+    if sepa_df.empty:
+        return sepa_df
+
+    df   = sepa_df.copy()
+    idx  = df.index
+
+    states = df["Breakout State"].astype(str) if "Breakout State" in df.columns else pd.Series([""] * len(df), index=idx)
+    pivots = df["Pivot Dist %"].apply(_pct_val)  if "Pivot Dist %"  in df.columns else pd.Series([0.0]  * len(df), index=idx)
+
+    t0 = states.isin({"BREAKOUT", "AT_PIVOT", "WEAK_BREAKOUT"}) & (pivots >= -5.0) & (pivots <= 5.0)
+    t1 = states.isin({"IN_BASE"})                                & (pivots >= -8.0) & (pivots <  -5.0)
+
+    tier = pd.Series(2, index=idx)
+    tier[t1] = 1
+    tier[t0] = 0
+
+    df["_trade_tier"] = tier
+    df = (df.sort_values(["_trade_tier", "SEPA Score"], ascending=[True, False])
+            .drop(columns=["_trade_tier"])
+            .reset_index(drop=True))
+    return df
+
+
 def _build_tier_a(sepa_df: pd.DataFrame, stage_map: dict, rs_map: dict,
-                  weights: dict, regime_label: str, regime_mult: float = 1.0) -> list:
+                  weights: dict, regime_label: str, regime_mult: float = 1.0,
+                  sector_results: dict = None, metadata: dict = None,
+                  market: str = "india") -> list:
     """
     Filter SEPA results to stocks with active entry signals that pass hard gates.
-    Score each with regime-aware unified score.
+    Score each with regime-aware unified score + sector multiplier.
     """
+    # Re-sort: actionable (near-pivot) stocks float to the top so the trade ranker
+    # sees them even if base-quality scoring pushed them to rank #25–30 in sepa_df.
+    sepa_df = _sort_sepa_for_trade(sepa_df)
+
     candidates = []
     g = _GATE
+    sector_results = sector_results or {}
+    metadata       = metadata or {}
 
     for _, row in sepa_df.iterrows():
         state      = str(row.get("Breakout State", ""))
@@ -264,7 +419,8 @@ def _build_tier_a(sepa_df: pd.DataFrame, stage_map: dict, rs_map: dict,
             weekly_boost  = 0.0
 
         # ── TheWrap gate: TW_FADING → Tier B only (demote, not hard exclude) ─
-        # TW_EXIT / TW_EXIT_40W / TW_CAUTIOUS were already excluded in SEPA ranker.
+        # TW_EXIT / TW_EXIT_40W were already excluded in SEPA ranker.
+        # TW_CAUTIOUS is now a score penalty in SEPA ranker (not hard excluded).
         # TW_FADING is in SEPA output but not a Tier A buy — aging trend.
         # TW_BULLISH / TW_MAINTAIN → additional weekly_boost
         tw_str = str(row.get("TheWrap", "—"))
@@ -289,7 +445,7 @@ def _build_tier_a(sepa_df: pd.DataFrame, stage_map: dict, rs_map: dict,
 
         # Component scores (all normalised 0–1)
         sepa_raw  = float(row.get("Raw Score", 0))
-        sepa_norm = min(sepa_raw / 80.0, 1.0)
+        sepa_norm = min(sepa_raw / 100.0, 1.0)   # Fix 5: cap at 100 not 80 (score range is 0-100)
 
         s2_pts    = float(stage_row.get("Stage Score S2", row.get("S2 Score", 0)))
         stage_norm = min(s2_pts / 10.0, 1.0)
@@ -323,14 +479,34 @@ def _build_tier_a(sepa_df: pd.DataFrame, stage_map: dict, rs_map: dict,
         # Reading from Stage output ("Duration (bars)" = consecutive daily bars
         # where the EMA200 slope stayed in the same direction).
         stage_dur = float(stage_row.get("Duration (bars)", 60)) if stage_row else 60.0
-        if stage_dur < 30:   # < 6 weeks of daily bars = too fresh, high failure rate
+        if stage_dur < 15:   # < 3 weeks — still establishing structure, genuine noise risk
             score *= 0.85    # 15% haircut — still tradeable, just discounted
+
+        # ── Sector rotation multiplier ─────────────────────────────────────────
+        # get_sector_for_ticker() looks up the sector of `ticker` in metadata,
+        # maps it to the matching SectorResult, and returns it (or None if unknown).
+        # Multiplier range: 0.75 (LAGGING) → 1.00 (NEUTRAL) → 1.25 (LEADING).
+        sector_res     = get_sector_for_ticker(ticker, metadata, sector_results, market)
+        sector_mult_v  = sector_res.sector_mult   if sector_res else 1.0
+        sector_label_v = sector_res.sector_label  if sector_res else "NEUTRAL"
+        sector_score_v = sector_res.sector_score  if sector_res else 50.0
+
+        # Soft gate: LAGGING sector → demote to Tier B (👁 Watchlist) instead of
+        # hard-excluding the stock. The user still sees it — they can override.
+        if sector_label_v == "LAGGING":
+            tier_label    = "👁 Watchlist"
+            demote_reason = f" | Sector LAGGING ({sector_score_v:.0f})"
+        else:
+            tier_label    = "🟢 Trade Now"
+            demote_reason = ""
+
+        score = round(score * sector_mult_v, 1)
 
         candidates.append({
             "_ticker":       ticker,
-            "_score":        round(score, 1),
-            "_tier":         "🟢 Trade Now",
-            "_reason":       reason,
+            "_score":        score,
+            "_tier":         tier_label,
+            "_reason":       reason + demote_reason,
             "_state":        state,
             "_sepa_raw":     sepa_raw,
             "_s2_pts":       round(s2_pts, 1),
@@ -357,6 +533,10 @@ def _build_tier_a(sepa_df: pd.DataFrame, stage_map: dict, rs_map: dict,
             "_sepa_score":   float(row.get("SEPA Score", 0)),
             "_path":         str(row.get("Path", "")),
             "_regime_mult":  regime_mult,
+            # Sector
+            "_sector_label": sector_label_v,
+            "_sector_score": round(sector_score_v, 1),
+            "_sector_mult":  round(sector_mult_v, 2),
         })
 
     return candidates
@@ -367,14 +547,17 @@ def _build_tier_a(sepa_df: pd.DataFrame, stage_map: dict, rs_map: dict,
 # =============================================================================
 
 def _build_tier_a_stage_rs(
-    stage_df:    pd.DataFrame,
-    rs_df:       pd.DataFrame,
-    sepa_map:    dict,
-    ohlcv:       dict,
-    weights:     dict,
-    regime_label: str,
-    regime_mult:  float,
-    exclude:      set,
+    stage_df:      pd.DataFrame,
+    rs_df:         pd.DataFrame,
+    sepa_map:      dict,
+    ohlcv:         dict,
+    weights:       dict,
+    regime_label:  str,
+    regime_mult:   float,
+    exclude:       set,
+    sector_results: dict = None,
+    metadata:       dict = None,
+    market:         str  = "india",
 ) -> list:
     """
     Tier A path 2 — catches genuine running leaders that SEPA misses.
@@ -413,6 +596,9 @@ def _build_tier_a_stage_rs(
     if stage_df.empty or rs_df.empty:
         return []
 
+    sector_results = sector_results or {}
+    metadata       = metadata or {}
+
     rs_map_local = _df_to_map(rs_df, "Ticker")
     candidates   = []
 
@@ -431,11 +617,32 @@ def _build_tier_a_stage_rs(
         if ticker in exclude:
             continue
 
-        # ── Gate 2: must be confirmed by RS Leaders screener ─────────────────
-        rs_row = rs_map_local.get(ticker)
-        if not rs_row:
-            continue
-        rs_pts = float(rs_row.get("RS Score", 0))
+        # ── Gate 2: RS confirmation ───────────────────────────────────────────
+        # Primary: stock appears in RS Leaders top-30 (two-lens confirmation).
+        # Fallback: Stage2 fast mover — RS is RISING in Stage output but the
+        #   stock hasn't yet earned RS Leader status (takes 13–26 weeks to build).
+        #   These are the "moved fast into Stage 2 and running" stocks.
+        #   Accepted only if Stage output shows RS Strong + clean entry + momentum.
+        rs_row       = rs_map_local.get(ticker)
+        is_rs_leader = rs_row is not None
+        rs_pts       = 0.0
+
+        if is_rs_leader:
+            rs_pts = float(rs_row.get("RS Score", 0))
+        else:
+            _rs_status = str(row.get("RS Status",    ""))
+            _momentum  = str(row.get("Momentum",     ""))
+            _has_rs    = "RS Strong" in _rs_status
+            _has_mom   = "↑" in _momentum      # ↑↑ Strong or ↑ Rising
+            # _has_entry gate REMOVED: it required "Near Pivot" or "Cheat Entry"
+            # which excluded stocks that ARE breaking out (entry = "⚪ Extended"
+            # because they just cleared the 4-week high). The pivot-distance gate
+            # below (dist_pct check) is the correct risk control — if the stock is
+            # too extended past its structural pivot it fails there.
+            if not (_has_rs and _has_mom):
+                continue   # no RS evidence or no momentum → skip
+            # Synthetic RS score: below RS Leader floor (65) — scored conservatively
+            rs_pts = 55.0 if "↑↑" in _rs_status else 42.0
 
         # ── Gate 3: weekly stage — demote if price is below weekly EMA ───────
         weekly_stage_str = str(row.get("Weekly Stage", "Unknown"))
@@ -483,10 +690,23 @@ def _build_tier_a_stage_rs(
 
         else:
             # ══════════════════════════════════════════════════════════════════
-            # SUB-PATH B: Standard Stage2+RS — at 20-bar breakout high
+            # SUB-PATH B: Standard Stage2+RS — at base pivot (detect_base) or
+            #             20-bar high fallback when no formal base is detected.
+            # Fix 7: use detect_base() so the pivot matches the VCP structure
+            # rather than a naive 20-bar rolling max that picks up intra-base
+            # noise and pushes the pivot reference too high, causing stocks to
+            # look "too extended" when they are actually just above a real base.
             # ══════════════════════════════════════════════════════════════════
-            high_20  = float(raw_df["high"].iloc[-20:].max())
-            dist_pct = (close - high_20) / high_20 * 100
+            _sepa_cfg   = SEPAConfig()
+            base_result = detect_base(
+                raw_df["high"], raw_df["low"], raw_df["close"], raw_df["volume"], _sepa_cfg
+            )
+            if base_result.valid:
+                pivot_high = base_result.base_high
+            else:
+                pivot_high = float(raw_df["high"].iloc[-20:].max())   # fallback
+
+            dist_pct = (close - pivot_high) / pivot_high * 100
 
             if dist_pct > _GATE["max_pivot_dist_pct"]:    # too extended past pivot
                 continue
@@ -498,10 +718,10 @@ def _build_tier_a_stage_rs(
                 entry = round(close * 1.001, 2)
             elif dist_pct > -3.0:
                 state = "AT_PIVOT"
-                entry = round(high_20 * 1.002, 2)
+                entry = round(pivot_high * 1.002, 2)
             else:
                 state = "WEAK_BREAKOUT"
-                entry = round(high_20 * 1.002, 2)
+                entry = round(pivot_high * 1.002, 2)
 
             # Stop: EMA21 × 0.97 is a cleaner structural stop than 15-bar swing low
             # (the 15-bar low picks up normal market noise; EMA21 is a deliberate MA)
@@ -553,8 +773,8 @@ def _build_tier_a_stage_rs(
             score *= 0.93
 
         # ── RS leading signal ─────────────────────────────────────────────────
-        rs_leads_price = str(rs_row.get("RS Leads Price", ""))
-        rs_at_high     = str(rs_row.get("RS at 52w High", ""))
+        rs_leads_price = str(rs_row.get("RS Leads Price", "")) if rs_row else ""
+        rs_at_high     = str(rs_row.get("RS at 52w High", "")) if rs_row else ""
         if rs_leads_price == "🌟 Leads":
             rs_leading = "🌟 RS Leads"
             score     += 6.0
@@ -564,9 +784,16 @@ def _build_tier_a_stage_rs(
             rs_leading = "·"
 
         # ── Reason and setup string ───────────────────────────────────────────
-        reason    = "Stage2 + RS Leader (Cheat)" if is_cheat else "Stage2 + RS Leader"
-        setup_str = entry_signal if is_cheat else f"RS Leader | Stage2 | {entry_signal}"
-        path_str  = "Stage2+RS+Cheat" if is_cheat else "Stage2+RS"
+        if is_rs_leader:
+            reason    = "Stage2 + RS Leader (Cheat)" if is_cheat else "Stage2 + RS Leader"
+            setup_str = entry_signal if is_cheat else f"RS Leader | Stage2 | {entry_signal}"
+            path_str  = "Stage2+RS+Cheat" if is_cheat else "Stage2+RS"
+        else:
+            # Fast-mover path: Stage2 + RS rising but not yet in RS Leaders top-30
+            reason    = "Stage2 + Momentum (Cheat)" if is_cheat else "Stage2 + Momentum"
+            setup_str = entry_signal if is_cheat else f"Momentum | Stage2 | {entry_signal}"
+            path_str  = "Stage2+Momentum"
+            score     = min(score, 68.0)   # cap: fresh movers rank below established RS Leaders
 
         weekly_label = (
             "W-Confirmed" if weekly_stage_str == "W-S2 ✓"
@@ -574,11 +801,26 @@ def _build_tier_a_stage_rs(
             else "W-Pending"
         )
 
+        # ── Sector rotation multiplier ─────────────────────────────────────────
+        sector_res     = get_sector_for_ticker(ticker, metadata, sector_results, market)
+        sector_mult_v  = sector_res.sector_mult   if sector_res else 1.0
+        sector_label_v = sector_res.sector_label  if sector_res else "NEUTRAL"
+        sector_score_v = sector_res.sector_score  if sector_res else 50.0
+
+        if sector_label_v == "LAGGING":
+            tier_label    = "👁 Watchlist"
+            demote_reason = f" | Sector LAGGING ({sector_score_v:.0f})"
+        else:
+            tier_label    = "🟢 Trade Now"
+            demote_reason = ""
+
+        score = round(score * sector_mult_v, 1)
+
         candidates.append({
             "_ticker":       ticker,
-            "_score":        round(score, 1),
-            "_tier":         "🟢 Trade Now",
-            "_reason":       reason,
+            "_score":        score,
+            "_tier":         tier_label,
+            "_reason":       reason + demote_reason,
             "_state":        state,
             "_sepa_raw":     0.0,
             "_s2_pts":       round(s2_pts, 1),
@@ -603,6 +845,10 @@ def _build_tier_a_stage_rs(
             "_sepa_score":   0.0,
             "_path":         path_str,
             "_regime_mult":  regime_mult,
+            # Sector
+            "_sector_label": sector_label_v,
+            "_sector_score": round(sector_score_v, 1),
+            "_sector_mult":  round(sector_mult_v, 2),
         })
 
     return candidates
@@ -614,12 +860,16 @@ def _build_tier_a_stage_rs(
 
 def _build_tier_b(rs_df: pd.DataFrame, stage_map: dict, sepa_map: dict,
                   ohlcv: dict, weights: dict, regime_label: str,
-                  exclude: set, regime_mult: float = 1.0) -> list:
+                  exclude: set, regime_mult: float = 1.0,
+                  sector_results: dict = None, metadata: dict = None,
+                  market: str = "india") -> list:
     """
     RS Leaders that are Stage 2 but have no active SEPA entry signal.
     These are your post-FTD buys — set price alerts at the pivot.
     """
-    candidates = []
+    sector_results = sector_results or {}
+    metadata       = metadata or {}
+    candidates     = []
 
     for _, row in rs_df.iterrows():
         ticker = str(row.get("Ticker", ""))
@@ -657,9 +907,16 @@ def _build_tier_b(rs_df: pd.DataFrame, stage_map: dict, sepa_map: dict,
         price = float(stage_row.get("Price ₹", 0)) if "Price ₹" in stage_row else 0.0
         pivot = _estimate_pivot(ohlcv.get(_restore_ticker(ticker, ohlcv), pd.DataFrame()), price)
 
+        # Sector info — applied to score for ranking; no soft gate (already Watchlist)
+        sector_res     = get_sector_for_ticker(ticker, metadata, sector_results, market)
+        sector_mult_v  = sector_res.sector_mult   if sector_res else 1.0
+        sector_label_v = sector_res.sector_label  if sector_res else "NEUTRAL"
+        sector_score_v = sector_res.sector_score  if sector_res else 50.0
+        score          = round(score * sector_mult_v, 1)
+
         candidates.append({
             "_ticker":       ticker,
-            "_score":        round(score, 1),
+            "_score":        score,
             "_tier":         "👁 Watchlist",
             "_reason":       reason,
             "_state":        "WATCHLIST",
@@ -690,6 +947,134 @@ def _build_tier_b(rs_df: pd.DataFrame, stage_map: dict, sepa_map: dict,
             "_sepa_score":   0.0,
             "_path":         "RS",
             "_regime_mult":  regime_mult,
+            # Sector
+            "_sector_label": sector_label_v,
+            "_sector_score": round(sector_score_v, 1),
+            "_sector_mult":  round(sector_mult_v, 2),
+        })
+
+    return candidates
+
+
+# =============================================================================
+# TIER B SUPPLEMENT — STAGE2 MOMENTUM (no RS Leader required)
+# =============================================================================
+
+def _build_tier_b_stage(
+    stage_df:       pd.DataFrame,
+    exclude:        set,
+    weights:        dict,
+    regime_label:   str,
+    regime_mult:    float = 1.0,
+    sector_results: dict  = None,
+    metadata:       dict  = None,
+    market:         str   = "india",
+) -> list:
+    """
+    Watchlist supplement — Stage2 fast movers not yet in RS Leaders top-30.
+
+    WHY THIS IS NEEDED:
+      RS Leader status requires 13–26 weeks of outperformance history to build.
+      A stock that just burst into Stage 2 won't have that history yet, so it
+      scores below the RS Leaders floor and is absent from rs_df entirely.
+      Without this path, such stocks are invisible in ALL trade candidate paths.
+
+    GATES:
+      • Stage 2 confirmed (from stage_df)
+      • RS Status = "RS Strong ↑↑" or "RS Strong ↑" (rising even if not Leader)
+      • Momentum = "↑↑ Strong" or "↑ Rising"  (the stock is actually moving)
+      • Vol Conviction ≠ "Low"                 (not a quiet drift)
+      • Weekly stage not W-S1 / W-S4           (price above weekly EMA)
+      • Not already in Tier A or Tier B (exclude set)
+
+    SCORE:
+      Stage S2 quality 60% + momentum 25% + volume 15% → max ~65.
+      Stays below Tier A Path 2 RS Leaders to preserve ranking hierarchy.
+
+    OUTPUT TIER: 👁 Watchlist — "set pivot alert" or monitor for entry.
+    """
+    if stage_df.empty:
+        return []
+
+    sector_results = sector_results or {}
+    metadata       = metadata or {}
+    candidates     = []
+
+    for _, row in stage_df.iterrows():
+        ticker = str(row.get("Ticker", ""))
+        if ticker in exclude:
+            continue
+
+        # Must show rising RS strength in Stage output
+        rs_status = str(row.get("RS Status", ""))
+        if "RS Strong" not in rs_status:
+            continue
+
+        # Must show upward momentum
+        momentum = str(row.get("Momentum", ""))
+        if "↑" not in momentum:
+            continue
+
+        # Require at least Normal volume conviction
+        vol_conv = str(row.get("Vol Conviction", ""))
+        if vol_conv == "Low":
+            continue
+
+        # Weekly gate: price must be above weekly EMA (not basing below it)
+        weekly_stage_str = str(row.get("Weekly Stage", "Unknown"))
+        if weekly_stage_str in ("W-S1 Accum", "W-S4 Decline"):
+            continue
+
+        # Score: stage quality + momentum + volume (no SEPA/RS Leader component)
+        s2_pts     = float(row.get("Stage Score S2", 0))
+        stage_norm = min(s2_pts / 10.0, 1.0)
+        mom_norm   = 1.0 if "↑↑" in momentum  else 0.6
+        vol_norm   = 1.0 if "Very High" in vol_conv else (0.7 if "High" in vol_conv else 0.4)
+
+        score = (stage_norm * 0.60 + mom_norm * 0.25 + vol_norm * 0.15) * 60.0
+        if "↑↑" in rs_status:
+            score += 5.0    # RS Strong ↑↑ gets a small boost over RS Strong ↑
+
+        # Sector multiplier
+        sector_res     = get_sector_for_ticker(ticker, metadata, sector_results, market)
+        sector_mult_v  = sector_res.sector_mult   if sector_res else 1.0
+        sector_label_v = sector_res.sector_label  if sector_res else "NEUTRAL"
+        sector_score_v = sector_res.sector_score  if sector_res else 50.0
+        score          = round(score * sector_mult_v, 1)
+
+        entry_signal = str(row.get("Entry Signal", ""))
+        candidates.append({
+            "_ticker":       ticker,
+            "_score":        score,
+            "_tier":         "👁 Watchlist",
+            "_reason":       "Stage2 + Momentum",
+            "_state":        "WATCHLIST",
+            "_sepa_raw":     0.0,
+            "_s2_pts":       round(s2_pts, 1),
+            "_rs_pts":       0.0,
+            "_rsi":          50.0,
+            "_stop_dist":    0.0,
+            "_pivot_dist":   0.0,
+            "_regime":       regime_label,
+            "_price":        0.0,
+            "_entry":        0.0,
+            "_stop":         0.0,
+            "_company":      str(row.get("Company", ticker)),
+            "_sector":       str(row.get("Sector",  "Unknown")),
+            "_tv":           str(row.get("TradingView", "")),
+            "_weekly_stage": weekly_stage_str,
+            "_weekly_label": "W-Confirmed" if weekly_stage_str == "W-S2 ✓" else "W-Pending",
+            "_tw_label":     "—",
+            "_rs_leading":   "·",
+            "_setup":        f"📋 Stage2 Momentum — {entry_signal}",
+            "_vcp":          0,
+            "_base_count":   0,
+            "_sepa_score":   0.0,
+            "_path":         "Stage2+Momentum",
+            "_regime_mult":  regime_mult,
+            "_sector_label": sector_label_v,
+            "_sector_score": round(sector_score_v, 1),
+            "_sector_mult":  round(sector_mult_v, 2),
         })
 
     return candidates
@@ -749,6 +1134,8 @@ def _build_trade_output(candidates: list, market: str, regime_mult: float = 1.0)
                 action = "🟡 BUY — confirm vol"
         elif state == "AT_PIVOT":
             action = "🔔 BUY STOP order"
+        elif state == "IN_BASE":
+            action = "📋 SET ALERT — buy stop at pivot"
         elif state == "WEAK_BREAKOUT":
             action = "🟡 CONFIRM VOL — watch"
         else:
@@ -796,6 +1183,8 @@ def _build_trade_output(candidates: list, market: str, regime_mult: float = 1.0)
             "Breakout State": state,
             "Regime ⚠":      _regime_warning(c["_regime"]),
             "Sector":        c["_sector"],
+            "Sector Label":  c.get("_sector_label", "NEUTRAL"),
+            "Sector ×":      c.get("_sector_mult",  1.0),
             "TradingView":   c["_tv"],
         })
 

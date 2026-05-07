@@ -37,13 +37,13 @@
 #     3. Distribution gate      — accumulation_ratio < 0.8 AND churn ≥ 2 → fail
 #
 #   Components:
-#     VCP contractions          25%   — number + quality of shrinking swings
-#     Volume character          20%   — up-day vs down-day vol + churn detection
+#     RS line leading           20%   — RS line at new high BEFORE price breaks out
+#     VCP contractions          12%   — shrinking swings + time compression bonus
+#     Volume character          18%   — up-day vs down-day vol + churn detection
 #     ATR contraction           15%   — ATR first half vs second half of base
-#     RS line leading           15%   — RS new high before price breaks out
-#     Volume dry-up             10%   — recent 5d vs pre-base 20d average
-#     Current tightness         10%   — last-third CV of closes
-#     Pivot proximity            5%   — distance from base high (pivot)
+#     Volume dry-up             12%   — recent 5d vs pre-base 20d average + 3-bar spring signal
+#     Pivot proximity           15%   — distance from base high (raised: surfaces near-pivot stocks)
+#     Current tightness          8%   — last-third CV of closes + tight-close streak bonus
 #
 #   Multipliers: regime × base_count_mult × weekly_cap
 #
@@ -70,7 +70,7 @@ from screeners.stage_analysis import StageAnalysisResult
 @dataclass
 class SEPAConfig:
     # Base detection
-    base_min_bars:         int   = 35    # minimum consolidation length (bars) — 7 weeks minimum
+    base_min_bars:         int   = 20    # minimum consolidation length (bars) — 4 weeks minimum
     base_max_bars:         int   = 65    # maximum (~13 weeks)
     base_max_depth_pct:    float = 35.0  # (high - low) / high must be < this
     base_max_up_slope:     float = 0.20  # %/bar — steeper = trending, not basing
@@ -129,6 +129,7 @@ class BaseResult:
 class VCPResult:
     num_contractions:      int   = 0
     last_is_tightest:      bool  = False
+    time_compressed:       bool  = False   # last contraction shorter in bars than prior
     contraction_pcts:      list  = field(default_factory=list)
     final_contraction_pct: float = 0.0
     vcp_score:             float = 0.0
@@ -214,9 +215,14 @@ class SEPAResult:
     base_count_mult: float = 1.0
 
     # ── Path A specific ───────────────────────────────────────────────────────
-    vol_surge_ratio: float = 0.0
-    s1_cv_pct:       float = 0.0
-    extension_pct:   float = 0.0
+    vol_surge_ratio:  float = 0.0
+    s1_cv_pct:        float = 0.0
+    extension_pct:    float = 0.0
+    pocket_pivot:     bool  = False   # up day volume > any down day in prior 10 sessions
+
+    # ── Path B specific ───────────────────────────────────────────────────────
+    tight_close_max:  int   = 0       # longest streak of closes within 1% of each other
+    time_compressed:  bool  = False   # VCP: last contraction shorter in bars than prior
 
     # ── Absolute prices (for trade execution output) ─────────────────────────
     price:         float = 0.0   # current close price
@@ -294,18 +300,27 @@ def run_sepa_analysis(
     rs_line = (close / bench_close).dropna()
 
     # ── Natural stop (display only) ───────────────────────────────────────────
+    # Minervini's actual stop = just below the base low (the floor of the consolidation).
+    # The 20d_low and EMA50 heuristics placed stops too deep inside old bases.
+    # When detect_base() finds a valid base below, we use base_low * 0.99.
+    # Fallback (no detected base): max(20d_low, EMA50) as before.
     slb = min(20, len(low))
     low_20d = float(low.iloc[-slb:].min())
     ema50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
-    r.stop_price = max(low_20d, ema50) if ema50 < price else low_20d
+    # base will be computed below in path routing — pre-compute here for stop only
+    _base_for_stop = detect_base(high, low, close, volume, cfg)
+    if _base_for_stop.valid and _base_for_stop.base_low > 0:
+        r.stop_price = _base_for_stop.base_low * 0.99   # just below base floor
+    else:
+        r.stop_price = max(low_20d, ema50) if ema50 < price else low_20d
     if r.stop_price >= price:
-        r.stop_price = low_20d
+        r.stop_price = low_20d * 0.99
     r.stop_dist_pct = (price - r.stop_price) / price * 100 if price > 0 else 15.0
 
     # ── Base detection — run once, used to route to correct path ────────────────
     # A trending stock naturally fails (highest high is very recent → base too short).
     # A stock in a real consolidation passes (highest high is 20+ bars ago).
-    base = detect_base(high, low, close, volume, cfg)
+    base = _base_for_stop   # already computed above for stop price — reuse
 
     # ── Path decision based on base state + price position vs pivot ─────────────
     #
@@ -370,6 +385,14 @@ def run_sepa_analysis(
     else:
         r.entry_price = round(pivot * 1.005, 2)  # buy-stop 0.5% above pivot
 
+    # ── Cheat entry bonus ─────────────────────────────────────────────────────
+    # EMA21 touch-and-bounce inside the base = Minervini's preferred within-base
+    # entry. It is the tightest possible stop (EMA21 × 0.97) with the highest
+    # probability — the stock has already proven its trend and is re-loading.
+    # +8 pts added BEFORE base_count_mult and regime_mult so it compounds.
+    if r.is_cheat_entry and r.sepa_score > 0:
+        r.sepa_score = min(100.0, r.sepa_score + 8.0)
+
     # ── Capture raw score BEFORE regime multiplier ────────────────────────────
     # Used by trade ranker to rank stocks on their own merits independently
     # of current market conditions (regime is shown as a separate warning).
@@ -420,13 +443,19 @@ def _score_path_a(
     weekly_stage: Weinstein weekly stage (0=unknown, 1=transition, 2=advancing, 3/4=bad)
     """
     # ── Weekly gate (same as Path B) ─────────────────────────────────────────
-    if weekly_stage in (3, 4):
-        r.setup_stage = "🚫 Weekly Stage 3/4"
+    # Stage 4 (price below falling 40W EMA) → hard exclude, no valid entry.
+    # Stage 3 (distribution/topping): NOT a hard exclude — many valid wide-base
+    #   and fresh Stage 3 breakout setups exist here. Apply score cap instead.
+    # Stage 1 (transition, price below but rising MA): fresh S2 transitions start here.
+    if weekly_stage == 4:
+        r.setup_stage = "🚫 Weekly Stage 4"
         r.sepa_score  = 0.0
         return
-    # weekly_stage=1 (transitioning) → cap composite at 60%; fresh breakouts CAN be
-    # in weekly Stage 1 transitioning to Stage 2 — this is actually ideal but warrants caution
-    weekly_cap = 1.0 if weekly_stage != 1 else 0.6
+    weekly_cap = (
+        0.65 if weekly_stage == 3   # distributing — score penalty, not exclude
+        else 0.65 if weekly_stage == 1   # transitioning — still actionable
+        else 1.0
+    )
 
     n   = len(close)
     dur = max(r.stage_duration, 1)
@@ -475,7 +504,8 @@ def _score_path_a(
     extension_score  = _score_extension(r.extension_pct)
 
     # ── Step 3: Breakout state (now that we have pivot) ───────────────────────
-    r.breakout_state = detect_breakout_state(price, r.base_high, volume, vol_50d)
+    # Fix 6: pass close so detect_breakout_state uses the exact breakout bar vol
+    r.breakout_state = detect_breakout_state(price, r.base_high, volume, vol_50d, close=close)
 
     # ── Step 4: Volume — TWO REGIMES based on state ───────────────────────────
     #
@@ -541,6 +571,15 @@ def _score_path_a(
     )
     r.rs_leading_score = rs_leading_score
 
+    # ── Step 5b: Pocket pivot detection ──────────────────────────────────────
+    # Minervini's highest-conviction WITHIN-BASE or POST-BREAKOUT buy point.
+    # Definition: today is an UP day whose volume exceeds the highest volume of
+    # any DOWN day in the prior 10 sessions — buyers overwhelmed all recent sellers.
+    pocket_pivot_bonus = 0.0
+    if detect_pocket_pivot(close, volume):
+        r.pocket_pivot     = True
+        pocket_pivot_bonus = 15.0   # strongest within-base entry signal
+
     # ── Step 6: Composite score ───────────────────────────────────────────────
     raw = (
         0.40 * vol_surge_score    +
@@ -548,7 +587,7 @@ def _score_path_a(
         0.20 * s1_tightness_score +
         0.15 * extension_score
     )
-    raw_score = round(raw * weekly_cap, 1)
+    raw_score = round(raw * weekly_cap + pocket_pivot_bonus, 1)
 
     # ── Step 7: Breakout quality gate (applies AFTER raw score) ───────────────
     #
@@ -605,12 +644,19 @@ def _score_path_b(
     Component scoring within detected base boundaries.
     """
     # ── Weekly gate ────────────────────────────────────────────────────────────
-    if weekly_stage in (3, 4):
-        r.setup_stage = "🚫 Weekly Stage 3/4"
+    # Stage 4 (price below falling 40W EMA) → hard exclude, structure broken.
+    # Stage 3 (distribution/topping): score cap not hard exclude — can be valid
+    #   long base or fresh breakout from an extended Stage 3 consolidation.
+    # Stage 1 (accumulation/transition): valid setup — many S2 moves start here.
+    if weekly_stage == 4:
+        r.setup_stage = "🚫 Weekly Stage 4"
         r.sepa_score  = 0.0
         return
-    # weekly_stage=1 (transition) → cap composite at 50; weekly_stage=0 (unknown) → no penalty
-    weekly_cap = 1.0 if weekly_stage != 1 else 0.5
+    weekly_cap = (
+        0.65 if weekly_stage == 3   # distribution — possible long base, score penalty
+        else 0.60 if weekly_stage == 1   # transition — fresh S2 entry, slight caution
+        else 1.0
+    )
 
     # ── Base detection (use pre-detected result if available) ─────────────────
     base = pre_base if pre_base is not None else detect_base(high, low, close, volume, cfg)
@@ -647,6 +693,7 @@ def _score_path_b(
     vcp = count_vcp_contractions(high, low, base_idx, cfg)
     r.num_contractions      = vcp.num_contractions
     r.last_is_tightest      = vcp.last_is_tightest
+    r.time_compressed       = vcp.time_compressed   # both amplitude AND time contracting
     r.final_contraction_pct = vcp.final_contraction_pct
     r.vcp_score             = vcp.vcp_score
 
@@ -683,6 +730,18 @@ def _score_path_b(
     r.vol_dry_ratio = recent_vol / pre_vol if pre_vol > 0 else 1.0
     r.vol_dry_score = _score_vol_dry(r.vol_dry_ratio)
 
+    # ── Final 3-bar dry-up completion bonus ───────────────────────────────────
+    # Minervini's key signal: the LAST 1-3 bars of the base should show
+    # "absolute dry-up" volume. This is the spring fully compressed — the
+    # entry is imminent. We score the 3-bar window separately and add a bonus
+    # so stocks at the very end of a dry-up receive higher priority.
+    last_3_vol   = float(volume.iloc[-3:].mean())
+    last_3_ratio = last_3_vol / pre_vol if pre_vol > 0 else 1.0
+    if last_3_ratio < 0.40:
+        r.vol_dry_score = min(100.0, r.vol_dry_score + 15.0)   # strong final coil
+    elif last_3_ratio < 0.55:
+        r.vol_dry_score = min(100.0, r.vol_dry_score + 8.0)
+
     # ── Current tightness — COILING not flat-stock bias ──────────────────────
     # Minervini's "tightness" means the final portion of the base is COILING TIGHTER
     # than the earlier part. A perpetually flat stock (NTPC, utility) will have low
@@ -704,6 +763,23 @@ def _score_path_b(
 
     r.current_cv_pct  = late_cv
     r.tightness_score = _score_tightness_coiling(late_cv, coiling_ratio)
+
+    # ── Tight closes bonus ────────────────────────────────────────────────────
+    # 3+ consecutive bars closing within 1% of each other = institutional
+    # "quiet accumulation" — the stock is being controlled. The longer the
+    # streak and the more recent, the more compelling the setup.
+    _tight_max, _tight_seqs = detect_tight_closes(close.iloc[-base.length_bars:])
+    r.tight_close_max = _tight_max
+    if _tight_max >= 5:
+        r.tightness_score = min(100.0, r.tightness_score + 18.0)
+    elif _tight_max >= 3:
+        r.tightness_score = min(100.0, r.tightness_score + 10.0)
+
+    # ── Pocket pivot detection ────────────────────────────────────────────────
+    pocket_pivot_bonus = 0.0
+    if detect_pocket_pivot(close, volume):
+        r.pocket_pivot     = True
+        pocket_pivot_bonus = 15.0
 
     # ── ATR contraction score ─────────────────────────────────────────────────
     # Pass the pre-base ATR baseline so the scoring can verify that ATR was
@@ -741,7 +817,7 @@ def _score_path_b(
         weights.get("pivot_proximity",   0.05) * r.pivot_score
     )
 
-    r.sepa_score  = round(raw * weekly_cap, 1)
+    r.sepa_score  = round(raw * weekly_cap + pocket_pivot_bonus, 1)
     r.setup_stage = _classify_path_b(r.pivot_dist_pct, r.vol_dry_ratio, r.atr_contraction,
                                      r.breakout_state, r.num_contractions)
 
@@ -856,15 +932,20 @@ def detect_base(
     # ── Prior advance check ───────────────────────────────────────────────────
     # The base must follow a meaningful prior uptrend — Minervini's #1 condition.
     # A stock that's been flat for 6 months and now forms a "base" is NOT a VCP.
-    # Look at up to 65 bars immediately before the base started and verify that
-    # price appreciated at least 15% to reach the base pivot.
+    # Fix 4: extend lookback to 130 bars (≈26 weeks / 6 months) so 2nd and 3rd
+    # bases are not rejected just because the prior advance started earlier.
+    # Also lower the required advance from 30% → 20% for the longer window:
+    # a stock that ran 20% in 26 weeks and is now forming its 2nd base IS a valid
+    # setup; demanding 30% in 13 weeks was systematically killing these entries.
     pre_base_end = n - base_length                          # bar index of base start
-    prior_lb     = min(65, pre_base_end)                    # how far back we look
+    prior_lb     = min(130, pre_base_end)                   # 26 weeks instead of 13
     if prior_lb >= 15 and pre_base_end > 0:
         prior_ref_close = float(close.iloc[max(0, pre_base_end - prior_lb)])
         advance_pct     = (base_high_val - prior_ref_close) / prior_ref_close * 100 if prior_ref_close > 0 else 0.0
-        if advance_pct < 30.0:
-            return BaseResult(reason=f"No prior advance ({advance_pct:.1f}% in {prior_lb}d)")
+        # Adaptive threshold: 30% in 13 weeks (fresh breakout) vs 20% in 26 weeks (2nd+ base)
+        min_advance = 20.0 if prior_lb <= 65 else 15.0
+        if advance_pct < min_advance:
+            return BaseResult(reason=f"No prior advance ({advance_pct:.1f}% in {prior_lb}d, need {min_advance:.0f}%)")
 
     # ATR contraction measurement
     atr_s      = _calc_atr_series(bh, bl, bc)
@@ -963,11 +1044,21 @@ def count_vcp_contractions(
             vcp_score             = _score_vcp(n_c, False),
         )
 
-    # ── Count valid (shrinking) contractions ──────────────────────────────────
+    # ── Count valid (shrinking) contractions with span tracking ──────────────
+    # Minervini: a genuine VCP requires BOTH price amplitude AND time to contract.
+    # Stocks that compress in price but stay wide in time are pauses, not coils.
+    # We track the bar-span of each contraction (sh[i] → sh[i+1]) and flag
+    # time_compressed when the last span is shorter than the prior one.
     valid_count = 0
+    spans = []   # bar count from one swing high to the next
     for i in range(1, len(contractions)):
         if contractions[i][1] < contractions[i - 1][1] * cfg.vcp_contraction_req:
             valid_count += 1
+        span = contractions[i][0] - contractions[i - 1][0]
+        spans.append(span)
+
+    # Time compression: last contraction's span is shorter than the prior one
+    time_compressed = len(spans) >= 2 and spans[-1] < spans[-2]
 
     amps = [c[1] for c in contractions]
     last_is_tightest = amps[-1] == min(amps)
@@ -975,9 +1066,10 @@ def count_vcp_contractions(
     return VCPResult(
         num_contractions      = valid_count,
         last_is_tightest      = last_is_tightest,
+        time_compressed       = time_compressed,
         contraction_pcts      = amps,
         final_contraction_pct = amps[-1],
-        vcp_score             = _score_vcp(valid_count, last_is_tightest),
+        vcp_score             = _score_vcp(valid_count, last_is_tightest, time_compressed),
     )
 
 
@@ -1045,6 +1137,7 @@ def detect_breakout_state(
     base_high:   float,
     volume:      pd.Series,
     vol_50d_avg: float,
+    close:       "pd.Series | None" = None,
 ) -> str:
     """
     Classify the stock's current position relative to its base.
@@ -1057,6 +1150,12 @@ def detect_breakout_state(
       WEAK_BREAKOUT — above base high, vol < 1.4× (suspect)
       FADING        — above base high, vol drying (failed breakout risk)
       EXTENDED      — > 10% above base high (too late)
+
+    Fix 6: `close` is optional. When provided the function scans backward
+    for the EXACT bar where price first crossed above base_high and uses that
+    bar's volume for classification — the same approach used in _score_path_a().
+    Without `close` it falls back to 5-bar peak (original behaviour), which is
+    still correct for callers that don't have the close series.
     """
     if base_high <= 0:
         return "UNKNOWN"
@@ -1066,14 +1165,29 @@ def detect_breakout_state(
     if dist > 10:
         return "EXTENDED"
     if dist > 0:
-        # Use 5-bar peak volume so a confirmed breakout 3 days ago doesn't
-        # downgrade to FADING just because today is a quiet follow-through day.
-        lookback_bars = min(5, len(volume))
-        vol_recent_peak = float(volume.iloc[-lookback_bars:].max())
-        vol_surge_peak = vol_recent_peak / vol_50d_avg if vol_50d_avg > 0 else 1.0
-        if vol_surge_peak >= 1.4:
+        # Fix 6: When close series is available, find the EXACT breakout bar
+        # so the state classification uses the same volume datum as _score_path_a().
+        # This prevents mismatches where a 3-day-old high-vol breakout still
+        # scores well in the scorer but gets a different vol_surge reading here.
+        if close is not None and len(close) > 1:
+            n = len(volume)
+            breakout_vol = float(volume.iloc[-1])       # default: today
+            for j in range(n - 1, max(n - 20, -1), -1):
+                if float(close.iloc[j]) <= base_high:
+                    bo_bar       = min(j + 1, n - 1)
+                    breakout_vol = float(volume.iloc[bo_bar])
+                    break
+            vol_surge = breakout_vol / vol_50d_avg if vol_50d_avg > 0 else 1.0
+        else:
+            # Fallback: 5-bar peak so a breakout 3 days ago doesn't downgrade
+            # to FADING just because today is a quiet follow-through day.
+            lookback_bars   = min(5, len(volume))
+            vol_recent_peak = float(volume.iloc[-lookback_bars:].max())
+            vol_surge       = vol_recent_peak / vol_50d_avg if vol_50d_avg > 0 else 1.0
+
+        if vol_surge >= 1.4:
             return "BREAKOUT"
-        elif vol_surge_peak >= 1.0:
+        elif vol_surge >= 1.0:
             return "WEAK_BREAKOUT"
         else:
             return "FADING"
@@ -1200,14 +1314,24 @@ def _base_count_multiplier(base_count: int) -> float:
 # SCORING FUNCTIONS  (0–100)
 # =============================================================================
 
-def _score_vcp(num_contractions: int, last_is_tightest: bool) -> float:
-    if num_contractions >= 3 and last_is_tightest: return 100.0
-    if num_contractions >= 3:                      return 75.0
-    if num_contractions == 2 and last_is_tightest: return 85.0
-    if num_contractions == 2:                      return 55.0
-    if num_contractions == 1 and last_is_tightest: return 45.0
-    if num_contractions == 1:                      return 25.0
-    return 0.0
+def _score_vcp(num_contractions: int, last_is_tightest: bool, time_compressed: bool = False) -> float:
+    """
+    Score VCP pattern quality.
+
+    time_compressed: the last contraction is shorter in bar-span than the prior one.
+    Minervini: genuine VCPs compress in BOTH price amplitude AND time — the stock
+    accelerates into the coil. A +20% bonus reflects this highest-conviction signal.
+    """
+    if num_contractions >= 3 and last_is_tightest: base = 100.0
+    elif num_contractions >= 3:                     base =  75.0
+    elif num_contractions == 2 and last_is_tightest: base =  85.0
+    elif num_contractions == 2:                      base =  55.0
+    elif num_contractions == 1 and last_is_tightest: base =  45.0
+    elif num_contractions == 1:                      base =  25.0
+    else:                                            base =   0.0
+    if time_compressed and base > 0:
+        base = min(100.0, base * 1.20)   # +20% for genuine time compression
+    return base
 
 
 def _score_atr_contraction(
@@ -1231,12 +1355,14 @@ def _score_atr_contraction(
          no genuine compression — this is a flat boring stock, not a VCP coil.
     """
     # Part 1: within-base contraction ratio
-    if ratio < 0.40: ratio_score = 100.0
-    elif ratio < 0.60: ratio_score = 85.0
-    elif ratio < 0.80: ratio_score = 65.0
-    elif ratio < 1.00: ratio_score = 40.0
-    elif ratio < 1.20: ratio_score = 15.0
-    else:              ratio_score = 0.0
+    # Tightened: ratio < 0.80 previously scored 65 — most bases pass this trivially.
+    # Now only true compression (< 0.60) earns a high score.
+    if ratio < 0.40:   ratio_score = 100.0
+    elif ratio < 0.60: ratio_score =  85.0
+    elif ratio < 0.80: ratio_score =  40.0   # was 65 — tightened
+    elif ratio < 1.00: ratio_score =  20.0   # was 40 — tightened
+    elif ratio < 1.20: ratio_score =   5.0   # was 15
+    else:              ratio_score =   0.0
 
     # Part 2: validate that ATR actually contracted FROM the pre-base level
     # atr_pct_late = ATR as % of price (normalises across different price levels)
@@ -1259,10 +1385,19 @@ def _score_atr_contraction(
 
 
 def _score_vol_character(acc_ratio: float, churn_count: int) -> float:
+    """
+    Score volume character within the base.
+
+    Thresholds deliberately tightened vs prior version:
+      ratio ≥ 1.0 (equal up/down vol) is NOT accumulation — it is neutral.
+      True accumulation requires up-day vol meaningfully above down-day vol (≥ 1.1×).
+      A stock with equal up/down vol scoring 60 inflated many mediocre setups.
+    """
     if acc_ratio >= 1.5 and churn_count == 0: return 100.0
-    if acc_ratio >= 1.3 and churn_count <= 1: return 80.0
-    if acc_ratio >= 1.0 and churn_count <= 2: return 60.0
-    if acc_ratio >= 0.8:                      return 35.0
+    if acc_ratio >= 1.3 and churn_count <= 1: return  80.0
+    if acc_ratio >= 1.1 and churn_count <= 2: return  60.0   # genuine accumulation starts here
+    if acc_ratio >= 1.0 and churn_count <= 2: return  40.0   # neutral — not yet accumulating
+    if acc_ratio >= 0.8:                      return  20.0   # slight distribution — caution
     return 10.0
 
 
@@ -1425,6 +1560,87 @@ def _classify_path_b(
 
 
 # =============================================================================
+# MINERVINI PATTERN DETECTORS
+# =============================================================================
+
+def detect_pocket_pivot(close: pd.Series, volume: pd.Series) -> bool:
+    """
+    Minervini Pocket Pivot: today is an UP day whose volume exceeds the highest
+    volume of any DOWN day in the prior 10 sessions.
+
+    This is the highest-conviction within-base or early-breakout buy signal:
+    buyers absorbed MORE supply in a single up day than the heaviest selling
+    session of the past two weeks — institutions are clearly accumulating.
+
+    Returns True only when today qualifies as a pocket pivot.
+    """
+    n = len(close)
+    if n < 12:
+        return False
+
+    # Today must be an up close vs yesterday
+    if float(close.iloc[-1]) <= float(close.iloc[-2]):
+        return False
+
+    today_vol = float(volume.iloc[-1])
+
+    # Prior 10 sessions (exclude today)
+    prior_close  = close.iloc[-11:-1]
+    prior_volume = volume.iloc[-11:-1]
+
+    # Down days: close lower than previous close
+    delta     = prior_close.diff().dropna()
+    down_mask = delta < 0
+    if down_mask.sum() == 0:
+        # No down days in prior 10 sessions — treat as ambiguous; skip
+        return False
+
+    max_down_vol = float(prior_volume.loc[prior_volume.index.isin(delta[down_mask].index)].max())
+    return today_vol > max_down_vol
+
+
+def detect_tight_closes(close: pd.Series) -> tuple:
+    """
+    Find the longest streak of consecutive bars closing within 1% of each other.
+
+    Minervini's "tight closes" = institutional control of price action.
+    When the stock refuses to move more than 1% day-over-day, a large buyer is
+    absorbing supply without moving the price — the spring is being wound.
+    The longer and more recent the streak, the more compelling the setup.
+
+    Returns:
+        max_streak  int  — length of longest tight-close streak in the series
+        sequences   list — all streak lengths ≥ 3, sorted descending
+    """
+    if len(close) < 3:
+        return 0, []
+
+    vals = close.values.astype(float)
+    n    = len(vals)
+
+    streaks   = []
+    current   = 1
+
+    for i in range(1, n):
+        prev = vals[i - 1]
+        if prev > 0 and abs(vals[i] - prev) / prev * 100 <= 1.0:
+            current += 1
+        else:
+            if current >= 3:
+                streaks.append(current)
+            current = 1
+
+    if current >= 3:
+        streaks.append(current)
+
+    if not streaks:
+        return 0, []
+
+    streaks.sort(reverse=True)
+    return streaks[0], streaks
+
+
+# =============================================================================
 # UTILS
 # =============================================================================
 
@@ -1481,8 +1697,8 @@ def _rsi_sepa_modifier(rsi: float, state: str) -> float:
     # BREAKOUT / WEAK_BREAKOUT / FADING / EXTENDED / other
     if 50 <= rsi <= 65:   return 1.05   # ideal: fresh momentum, room to run
     if 65 < rsi <= 75:    return 1.00   # strong, acceptable
-    if 75 < rsi <= 82:    return 0.93   # somewhat extended
-    if rsi > 82:          return 0.82   # very extended — likely to pull back
+    if 75 < rsi <= 82:    return 0.97   # somewhat extended — light touch only
+    if rsi > 82:          return 0.88   # very extended — moderate penalty
     if 40 <= rsi < 50:    return 0.93   # fading momentum
     return 0.80                          # < 40 — momentum absent, not a breakout
 
@@ -1514,11 +1730,11 @@ def _default_weights() -> dict:
         return SEPA_WEIGHTS
     except ImportError:
         return {
-            "vcp_contractions":  0.25,
-            "vol_character":     0.20,
+            "vcp_contractions":  0.12,   # time_compressed + tight-close bonuses still reward genuine VCPs
+            "vol_character":     0.18,
             "atr_contraction":   0.15,
-            "rs_leading":        0.15,
-            "vol_dry_up":        0.10,
-            "current_tightness": 0.10,
-            "pivot_proximity":   0.05,
+            "rs_leading":        0.20,   # Minervini's #1 leading indicator
+            "vol_dry_up":        0.12,   # spring completion is critical
+            "current_tightness": 0.08,   # tight-close streak bonus covers extreme cases
+            "pivot_proximity":   0.15,   # raised 5%→15% — surfaces near-pivot stocks in SEPA top-30
         }

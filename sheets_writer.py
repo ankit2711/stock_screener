@@ -37,6 +37,8 @@ from config import (
     OUTPUT_COLUMNS_TRADE_SEPA,
     OUTPUT_COLUMNS_RS,
     OUTPUT_COLUMNS_HOLDINGS_ALERT,
+    OUTPUT_COLUMNS_CONVICTION,
+    OUTPUT_COLUMNS_DATA_QUALITY,
     MAX_HISTORY_TABS,
 )
 
@@ -133,24 +135,50 @@ def write_results(df: pd.DataFrame, market: str, screener: str = "stage") -> Non
             rs_df             = df.get("rs",             pd.DataFrame())
             trade_df          = df.get("trade",          pd.DataFrame())
             holdings_alert_df = df.get("holdings_alert", pd.DataFrame())
+            conviction_df     = df.get("conviction",     pd.DataFrame())
+            data_quality_df   = df.get("data_quality",   pd.DataFrame())
+            sector_res        = df.get("sectors",        {})
         else:
             # Legacy: single DataFrame passed — write to trade tab only
             stage_df = sepa_df = rs_df = holdings_alert_df = pd.DataFrame()
-            trade_df = df
+            trade_df  = df
+            sector_res = {}
 
         # Stage / SEPA / RS: fixed tabs only — overwritten each run, always current.
         _write_tab(sheet, SHEET_TABS["stage_trade"], stage_df, market, OUTPUT_COLUMNS_TRADE_STAGE)
         _write_tab(sheet, SHEET_TABS["sepa_trade"],  sepa_df,  market, OUTPUT_COLUMNS_TRADE_SEPA)
         _write_tab(sheet, SHEET_TABS["rs_trade"],    rs_df,    market, OUTPUT_COLUMNS_RS)
 
-        # Trade Candidates: fixed tab (daily action view) + dated archive (history).
-        _write_tab(sheet, SHEET_TABS["trade"],   trade_df, market, OUTPUT_COLUMNS_TRADE)
-        _write_tab(sheet, f"{today}-trade",      trade_df, market, OUTPUT_COLUMNS_TRADE)
+        # Trade Candidates: fixed tab only — exited stocks stay at the bottom for 14 days,
+        # so there is no need for a separate dated archive tab.
+        _write_tab(sheet, SHEET_TABS["trade"], trade_df, market, OUTPUT_COLUMNS_TRADE)
+
+        # Daily BUY Conviction: stocks confirmed by 2+ screeners simultaneously.
+        # Sorted by Streak DESC → consecutive days = institutional persistence signal.
+        # This is the primary daily BUY watchlist tab — open this first every morning.
+        _write_tab(sheet, SHEET_TABS["conviction"], conviction_df, market, OUTPUT_COLUMNS_CONVICTION)
+
+        # Data Issues: tickers with NaN price/volume, stale feeds, or price spikes.
+        # Shows exactly which stocks the screeners are silently skipping and why.
+        _write_tab(sheet, SHEET_TABS["data_quality"], data_quality_df, market, OUTPUT_COLUMNS_DATA_QUALITY)
 
         # Holdings Alert: ONLY held positions sorted by TheWrap urgency.
         # Open this tab first every morning before checking your broker.
         _write_tab(sheet, SHEET_TABS["holdings_alert"], holdings_alert_df, market,
                    OUTPUT_COLUMNS_HOLDINGS_ALERT)
+
+        # Sector Rotation: fixed tab — flat ranked list.
+        # Always written (even if sector scan returned nothing) so the tab exists.
+        try:
+            from ranker_sector import sector_results_to_df
+            sector_df = sector_results_to_df(sector_res) if sector_res else pd.DataFrame()
+            _write_tab(sheet, SHEET_TABS["sectors"], sector_df, market, col_list=None)
+        except Exception as _se:
+            logger.warning(f"Sector Rotation tab write failed: {_se}")
+
+        # Sector Overview: fixed tab — sectors grouped into Leading → Lagging buckets.
+        # Always written so the tab exists even when sector data is unavailable.
+        _write_sector_buckets_tab(sheet, SHEET_TABS["sector_overview"], sector_res, market)
 
     elif screener == "rs":
         # Standalone RS scan — fixed tab only (consistent with above)
@@ -169,6 +197,94 @@ def write_results(df: pd.DataFrame, market: str, screener: str = "stage") -> Non
 # -----------------------------------------------------------------------------
 # INTERNAL HELPERS
 # -----------------------------------------------------------------------------
+
+def _write_sector_buckets_tab(
+    sheet,
+    tab_name:      str,
+    sector_results: dict,
+    market:        str,
+) -> None:
+    """
+    Write the bucketed sector overview tab.
+
+    Layout: LEADING → IMPROVING → NEUTRAL → WEAKENING → LAGGING.
+    Each bucket has a bold shaded header, a column-header row, and data rows.
+    Bucket header rows and column header rows are formatted bold + light grey.
+    """
+    try:
+        from ranker_sector import sector_results_to_bucketed_rows
+
+        ws = _get_or_create_worksheet(sheet, tab_name)
+        ws.clear()
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        if not sector_results:
+            ws.update("A1", [[
+                f"Sector scan returned no data — {now}",
+                "Check screener.log for details. "
+                "Ensure sector indices (^CNXIT, ^NSEBANK …) are reachable via yfinance."
+            ]])
+            logger.warning(f"Sector Overview tab '{tab_name}': no sector data to display")
+            return
+
+        rows, bucket_hdr_rows, col_hdr_rows = sector_results_to_bucketed_rows(
+            sector_results, market=market, as_of=now,
+        )
+
+        if not rows:
+            ws.update("A1", [[f"No sector data — {now}"]])
+            return
+
+        # Write all rows in one call
+        ws.update("A1", rows, value_input_option="USER_ENTERED")
+
+        # ── Optional formatting (best-effort — gspread ≥ 5.x) ────────────────
+        # Row 1 (summary) bold + dark background
+        # Bucket label rows: bold + light grey fill
+        # Column header rows: bold
+        try:
+            num_cols = 14  # matches len(_BUCKET_COLS)
+            last_col_letter = chr(ord("A") + num_cols - 1)  # "N"
+
+            def _fmt(row_idx: int, bold: bool, bg: dict | None = None):
+                fmt: dict = {"textFormat": {"bold": bold}}
+                if bg:
+                    fmt["backgroundColor"] = bg
+                ws.format(f"A{row_idx}:{last_col_letter}{row_idx}", fmt)
+
+            # Summary row
+            _fmt(1, bold=True, bg={"red": 0.20, "green": 0.20, "blue": 0.20})
+            ws.format("A1:A1", {
+                "textFormat": {"bold": True, "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}},
+                "backgroundColor": {"red": 0.20, "green": 0.20, "blue": 0.20},
+            })
+
+            # Bucket header rows — bold + light silver background
+            for r_idx in bucket_hdr_rows:
+                ws.format(f"A{r_idx}:{last_col_letter}{r_idx}", {
+                    "textFormat": {"bold": True, "fontSize": 10},
+                    "backgroundColor": {"red": 0.88, "green": 0.88, "blue": 0.88},
+                })
+
+            # Column header rows — bold
+            for r_idx in col_hdr_rows:
+                ws.format(f"A{r_idx}:{last_col_letter}{r_idx}", {
+                    "textFormat": {"bold": True},
+                    "backgroundColor": {"red": 0.95, "green": 0.95, "blue": 0.95},
+                })
+
+        except Exception:
+            pass  # formatting is optional — data is already written
+
+        logger.info(
+            f"Sector Overview tab '{tab_name}' written "
+            f"({len(sector_results)} sectors, {len(rows)} rows)"
+        )
+
+    except Exception as e:
+        logger.warning(f"Sector Overview tab write failed: {e}")
+
 
 def _write_tab(
     sheet,

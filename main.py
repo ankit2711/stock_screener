@@ -49,6 +49,7 @@ from ranker_stage import run_screens_stage
 from ranker_sepa  import run_screens_sepa
 from ranker_trade import run_trade_scan
 from ranker_rs    import run_screens_rs
+from ranker_sector import print_sector_dashboard
 from screeners.stage_analysis import StageAnalysisConfig
 from config import (
     RS_RATING, SCHEDULE_ENABLED, SCHEDULE_TIME_IST, FETCH_MARKETS_ORDER,
@@ -244,6 +245,13 @@ def run_india(screener: str = "stage") -> bool:
                     f"RS={len(results.get('rs', []))}, "
                     f"Trade={len(results.get('trade', []))}")
         _log_top_results(results.get("trade", pd.DataFrame()), "INDIA", "trade")
+        # ── Sector Rotation Dashboard (trade mode only) ───────────────────────
+        if screener == "trade":
+            sector_results = results.get("sectors", {})
+            if sector_results:
+                print_sector_dashboard(sector_results, market="india", show_detail=False)
+            else:
+                logger.info("  [Sector] No sector data available (sector scan may have failed).")
     else:
         count = len(results) if results is not None and hasattr(results, "__len__") else 0
         logger.info(f"  India [{screener}]: {count} stocks returned")
@@ -287,6 +295,10 @@ def run_ai(screener: str = "stage") -> bool:
             f"Trade={len(results.get('trade', []))}"
         )
         _log_top_results(results.get("trade", pd.DataFrame()), "AI THEME", "trade")
+        if screener == "trade":
+            sector_results = results.get("sectors", {})
+            if sector_results:
+                print_sector_dashboard(sector_results, market="ai", show_detail=False)
     else:
         count = len(results) if results is not None and hasattr(results, "__len__") else 0
         logger.info(f"  AI [{screener}]: {count} stocks returned")
@@ -328,6 +340,10 @@ def run_us(screener: str = "stage") -> bool:
                     f"RS={len(results.get('rs', []))}, "
                     f"Trade={len(results.get('trade', []))}")
         _log_top_results(results.get("trade", pd.DataFrame()), "US", "trade")
+        if screener == "trade":
+            sector_results = results.get("sectors", {})
+            if sector_results:
+                print_sector_dashboard(sector_results, market="us", show_detail=False)
     else:
         count = len(results) if results is not None and hasattr(results, "__len__") else 0
         logger.info(f"  US [{screener}]: {count} stocks returned")
