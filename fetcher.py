@@ -183,6 +183,20 @@ def _fetch_yfinance_chunked(
     For each chunk: tries batch download first, then falls back to
     per-ticker individual downloads for any that fail in the batch.
     Returns (results_dict, failed_tickers_list).
+
+    RECENT vs HISTORICAL fetch strategy:
+      ≤ 7 calendar day window  → period='5d'
+        yfinance's period parameter reliably returns the latest available bar
+        (including today after market close). The start/end date API often
+        returns empty or T-1 data for same-day or next-day windows because
+        yfinance resolves dates in UTC and EOD data may not yet be indexed.
+
+      > 7 calendar day window  → explicit start/end dates
+        For full history fetches, start/end is more precise and avoids
+        over-fetching months of data.
+
+    The SQLite cache uses INSERT OR IGNORE, so older bars returned by
+    period='5d' that are already cached are silently skipped.
     """
     results = {}
     failed  = []
@@ -196,8 +210,25 @@ def _fetch_yfinance_chunked(
     chunk_num = 0
 
     for (start_str, end_str), group in range_groups.items():
-        # yfinance end is exclusive — add 1 day to include today's bar
-        end_yf = (date.fromisoformat(end_str) + timedelta(days=1)).isoformat()
+        start_date = date.fromisoformat(start_str)
+        end_date   = date.fromisoformat(end_str)
+        days_range = (end_date - start_date).days   # 0 = same-day window (just today)
+
+        if days_range <= 7:
+            # Recent window — use period='5d' for reliable latest-bar delivery.
+            # This covers: daily update (0 days), weekend (2-3 days),
+            # long weekend / market holiday (4-7 days).
+            period_yf = "5d"
+            end_yf    = None          # not used when period is set
+            logger.debug(
+                f"  [{market.upper()}] Using period='5d' for {len(group)} tickers "
+                f"(window={days_range}d, start={start_str})"
+            )
+        else:
+            # Historical window — explicit dates are more precise.
+            # yfinance end is exclusive, so add 1 day to include end_str's bar.
+            period_yf = None
+            end_yf    = (end_date + timedelta(days=1)).isoformat()
 
         chunks = [
             group[i: i + YF_CHUNK_SIZE]
@@ -206,7 +237,7 @@ def _fetch_yfinance_chunked(
 
         for chunk in chunks:
             chunk_num += 1
-            ok, fail = _yf_chunk_with_retry(chunk, start_str, end_yf)
+            ok, fail = _yf_chunk_with_retry(chunk, start_str, end_yf, period=period_yf)
             results.update(ok)
             failed.extend(fail)
             processed += len(chunk)
@@ -222,9 +253,10 @@ def _fetch_yfinance_chunked(
 
 
 def _yf_chunk_with_retry(
-    tickers: list[str],
+    tickers:   list[str],
     start_str: str,
-    end_str: str,
+    end_str:   str | None,
+    period:    str | None = None,
 ) -> tuple[dict, list]:
     """
     Download a chunk via yfinance.
@@ -233,6 +265,13 @@ def _yf_chunk_with_retry(
       1. Try a batch download with retries (fast path).
       2. For any ticker that fails in the batch, retry it individually
          (slow path — isolates bad tickers from good ones).
+
+    Args:
+        tickers:   list of ticker symbols
+        start_str: fetch start date (ISO string) — used when period is None
+        end_str:   fetch end date exclusive (ISO string) — used when period is None
+        period:    yfinance period string e.g. '5d', '1mo' — when set, start/end
+                   are ignored by yfinance. Use for recent-data fetches.
 
     NOTE: threads=False is intentional.
       yfinance's threaded download causes race conditions when certain
@@ -243,19 +282,32 @@ def _yf_chunk_with_retry(
     results = {}
     failed  = list(tickers)  # start assuming all failed
 
-    # ── Step 1: batch download (fast) ────────────────────────────────────────
-    for attempt in range(YF_RETRY_LIMIT):
-        try:
-            raw = yf.download(
-                tickers,
+    def _download(syms, **extra):
+        """Shared download call — uses period or start/end depending on context."""
+        if period:
+            return yf.download(
+                syms,
+                period=period,
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+                **extra,
+            )
+        else:
+            return yf.download(
+                syms,
                 start=start_str,
                 end=end_str,
                 auto_adjust=True,
                 progress=False,
-                threads=False,   # sequential: avoids NoneType race conditions
-                # group_by="ticker" intentionally omitted:
-                # yfinance 1.x always returns (Price, Ticker) MultiIndex regardless
+                threads=False,
+                **extra,
             )
+
+    # ── Step 1: batch download (fast) ────────────────────────────────────────
+    for attempt in range(YF_RETRY_LIMIT):
+        try:
+            raw = _download(tickers)
             ok, fail = _parse_yf_download(raw, tickers)
             results.update(ok)
             failed = fail
@@ -274,14 +326,7 @@ def _yf_chunk_with_retry(
     still_failed = []
     for ticker in failed:
         try:
-            raw_s = yf.download(
-                [ticker],
-                start=start_str,
-                end=end_str,
-                auto_adjust=True,
-                progress=False,
-                threads=False,
-            )
+            raw_s = _download([ticker])
             ok_s, _ = _parse_yf_download(raw_s, [ticker])
             if ok_s:
                 results.update(ok_s)
@@ -363,7 +408,14 @@ def _parse_yf_download(raw: pd.DataFrame, tickers: list[str]) -> tuple[dict, lis
                 failed.append(ticker)
                 continue
 
-            df = df[needed].dropna()
+            df = df[needed].copy()
+            # Require valid OHLC — but allow NaN volume (common on latest bar
+            # for NSE stocks where exchange volume data lags a few minutes).
+            # NaN volume → 0 so downstream liquidity filters treat it as low
+            # rather than silently dropping the entire row (which hides today's close).
+            df = df.dropna(subset=["open", "high", "low", "close"])
+            df["volume"] = df["volume"].fillna(0)
+            df = df[df["close"] > 0]          # drop zero-price rows (bad ticks)
             df.index = pd.to_datetime(df.index)
 
             if len(df) > 0:
