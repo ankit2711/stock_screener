@@ -232,6 +232,7 @@ def run_conviction_scan(
                 "Action":       "⚪ Exited",
                 "RS Signal":    "—",
                 "Price ₹":      price_str,
+                "ROC 5D %":     "—",        # no live ROC for exited rows
                 "Pivot Dist %": "—",
                 "Weekly Stage": "—",
                 "Sector":       e["sector"],
@@ -255,6 +256,12 @@ def run_conviction_scan(
         df_out = pd.concat([df_out, df_sep, df_exited], ignore_index=True)
 
     df_out.insert(0, "Rank", range(1, len(df_out) + 1))
+
+    # Replace any remaining NaN with "" so JSON serialisation (gspread) never fails.
+    # NaN can appear in columns that exist on active rows but are absent from
+    # exited/separator dicts after pd.concat (e.g. ROC 5D % before fix, or future
+    # columns added later).
+    df_out = df_out.where(pd.notna(df_out), other="")
 
     triple = int((df_out["# Signals"] == 3).sum())
     double = int((df_out["# Signals"] == 2).sum())
