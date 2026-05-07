@@ -163,7 +163,12 @@ def run_conviction_scan(
         return pd.DataFrame()
 
     df_out = pd.DataFrame(candidates)
-    df_out = df_out.sort_values("Conviction", ascending=False).head(TOP_N_CONVICTION)
+    # Sort by Conviction DESC, then ROC 5D % DESC as tiebreaker.
+    # On strong market days many stocks score conviction=100; without a tiebreaker
+    # head(20) is arbitrary and big-move stocks can be unfairly cut.
+    df_out = df_out.sort_values(
+        ["Conviction", "ROC 5D %"], ascending=[False, False]
+    ).head(TOP_N_CONVICTION)
     df_out = df_out.reset_index(drop=True)
 
     # Persistence bucket is scoped per market so India / US / AI streaks don't mix.
@@ -197,6 +202,27 @@ def run_conviction_scan(
                 tv_sym = f"BSE:{t}"
             else:
                 tv_sym = t
+
+            # ── Live price lookup ─────────────────────────────────────────────
+            # Prefer today's close from ohlcv over the stale persistence price.
+            # Try the raw key first, then with common suffixes (.NS, .BO).
+            price_str = e["last_price"]   # fallback: last seen price in persistence
+            raw_key   = e["ticker"]
+            if raw_key not in ohlcv:
+                for suffix in (".NS", ".BO", ""):
+                    candidate = t + suffix
+                    if candidate in ohlcv:
+                        raw_key = candidate
+                        break
+            if raw_key in ohlcv:
+                try:
+                    live_close = float(ohlcv[raw_key]["close"].dropna().iloc[-1])
+                    if live_close > 0:
+                        market_sym = "₹" if market in ("india",) else "$"
+                        price_str = f"{market_sym}{live_close:,.2f}"
+                except Exception:
+                    pass   # stick with persistence fallback
+
             exited_rows.append({
                 "Ticker":       t,
                 "Company":      e["company"],
@@ -205,7 +231,7 @@ def run_conviction_scan(
                 "Conviction":   "—",
                 "Action":       "⚪ Exited",
                 "RS Signal":    "—",
-                "Price ₹":      e["last_price"],
+                "Price ₹":      price_str,
                 "Pivot Dist %": "—",
                 "Weekly Stage": "—",
                 "Sector":       e["sector"],
@@ -328,6 +354,17 @@ def _score_stock(
     if n_signals < MIN_SIGNALS:
         return None
 
+    # ── ROC 5D % — tiebreaker when conviction scores cluster ─────────────────
+    # Used to rank stocks when many hit conviction=100 on strong market days.
+    roc_5d = 0.0
+    if len(close) >= 6:
+        try:
+            roc_5d = round(
+                (float(close.iloc[-1]) - float(close.iloc[-6])) / float(close.iloc[-6]) * 100, 2
+            )
+        except Exception:
+            roc_5d = 0.0
+
     # ── Weighted conviction score ─────────────────────────────────────────────
     w_sum  = 0.0
     sc_sum = 0.0
@@ -388,6 +425,7 @@ def _score_stock(
         "# Signals":     n_signals,
         "Signals":       signals_str,
         "Conviction":    conviction,
+        "ROC 5D %":      roc_5d,
         "Action":        action,
         "RS Signal":     rs_signal,
         "Price ₹":       f"₹{price:,.2f}" if price and price > 0 else "—",

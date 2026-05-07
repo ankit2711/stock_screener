@@ -427,6 +427,7 @@ OUTPUT_COLUMNS_CONVICTION = [
     "Signals",       # "Stage ✓ | RS ✓ | SEPA ✓" — compact signal breakdown
     "RS Signal",     # 🌟 RS Leads Price (pre-breakout) / ✓ RS at 52w High / ·
     "Price ₹",
+    "ROC 5D %",      # 5-day rate of change — tiebreaker when conviction scores cluster; shows recent momentum
     "Sector",
     # Removed: Conviction (top-20 by score + sorted by it — the column has no display variance)
     # Removed: Pivot Dist % (always 0 in practice — near-pivot is already the entry condition)
