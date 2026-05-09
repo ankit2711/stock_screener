@@ -1328,11 +1328,11 @@ def _stage_exit_reason(ticker: str, saved_row: dict, ohlcv: dict) -> str:
     raw_key = _restore_ticker(ticker, ohlcv)
     df = ohlcv.get(raw_key, pd.DataFrame())
     if df.empty or "close" not in df.columns:
-        return "Stage criteria lost"
+        return "Stage 2 — no OHLCV data available"
 
     close = df["close"].dropna()
     if len(close) < 50:
-        return "Stage criteria lost"
+        return "Stage 2 — insufficient price history"
 
     try:
         ema21_s  = close.ewm(span=21,  adjust=False).mean()
@@ -1369,7 +1369,14 @@ def _stage_exit_reason(ticker: str, saved_row: dict, ohlcv: dict) -> str:
         if "Weak" in last_rs and not parts:
             parts.append(f"RS weakened (was {last_rs})")
 
-        return " · ".join(parts) if parts else "Stage 2 criteria lost"
+        if parts:
+            return " · ".join(parts)
+
+        # All EMA/RS checks still pass — the stock is still in Stage 2 but
+        # scored lower than the other 30 stocks in the universe today.
+        last_score = saved_row.get("Score", "") or saved_row.get("Stage Score S2", "")
+        score_str  = f" — score was {float(last_score):.2f}" if last_score else ""
+        return f"Ranked out of Stage Leaders top 30{score_str} (EMA structure intact)"
     except Exception:
         return "Stage 2 structure lost"
 
