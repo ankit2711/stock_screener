@@ -282,11 +282,20 @@ def append_screener_exits(
         rec["row"]         = row_dict
 
     # ── Step 2: stamp exit_date + reason for tickers that just dropped out ────
+    # exit_reason can be a plain string OR callable(ticker, saved_row) -> str
+    # so callers can pass OHLCV-based diagnostic logic per screener.
     for ticker, rec in state.items():
         if ticker not in active:
             if rec.get("last_seen") and rec.get("exit_date") is None:
-                rec["exit_date"]   = rec["last_seen"]
-                rec["exit_reason"] = exit_reason   # record WHY it left this screener
+                rec["exit_date"] = rec["last_seen"]
+                if callable(exit_reason):
+                    try:
+                        rec["exit_reason"] = exit_reason(ticker, rec.get("row", {}))
+                    except Exception as _re:
+                        logger.debug(f"exit_reason_fn failed for {ticker}: {_re}")
+                        rec["exit_reason"] = "Left scan"
+                else:
+                    rec["exit_reason"] = str(exit_reason)
 
     data[bucket] = state
     _save(data)
@@ -313,7 +322,7 @@ def append_screener_exits(
 
         saved_row = dict(rec.get("row", {}))
         saved_row[exit_col]         = ed
-        saved_row[exit_reason_col]  = rec.get("exit_reason") or exit_reason
+        saved_row[exit_reason_col]  = rec.get("exit_reason") or "—"
         saved_row[key_col]          = ticker      # ensure ticker is present
 
         # Stale rank is misleading — blank it out for exited rows

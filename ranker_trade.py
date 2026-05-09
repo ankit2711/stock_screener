@@ -299,21 +299,29 @@ def run_trade_scan(
     # daily dated tabs) so this provides rolling history without tab proliferation.
     logger.info("TRADE SCAN: Appending 14-day exit history to screener tabs...")
     try:
+        # Snapshot active-only DFs before exits are appended so the trade
+        # reason function sees clean ticker lists (not separator/exited rows).
+        _active_stage = stage_df.copy() if not stage_df.empty else stage_df
+        _active_sepa  = sepa_df.copy()  if not sepa_df.empty  else sepa_df
+        _active_rs    = rs_df.copy()    if not rs_df.empty    else rs_df
+
         stage_df = append_screener_exits(
             stage_df, bucket=f"stage_{market}",
-            exit_reason="Stage 2 structure lost",
+            exit_reason=lambda t, row: _stage_exit_reason(t, row, ohlcv),
         )
         sepa_df  = append_screener_exits(
             sepa_df,  bucket=f"sepa_{market}",
-            exit_reason="Setup invalidated",
+            exit_reason=lambda t, row: _sepa_exit_reason(t, row, ohlcv),
         )
         rs_df    = append_screener_exits(
             rs_df,    bucket=f"rs_{market}",
-            exit_reason="RS leadership lost",
+            exit_reason=lambda t, row: _rs_exit_reason(t, row, ohlcv, benchmark),
         )
         trade_df = append_screener_exits(
             trade_df, bucket=f"trade_{market}",
-            exit_reason="Left trade candidates",
+            exit_reason=lambda t, row: _trade_exit_reason(
+                t, row, ohlcv, _active_stage, _active_sepa, _active_rs
+            ),
         )
     except Exception as _ee:
         logger.warning(f"TRADE SCAN: Exit history append failed (non-fatal): {_ee}")
@@ -1297,6 +1305,211 @@ def _pct_val(v) -> float:
         return float(str(v).replace("%", "").replace("+", "").strip())
     except (ValueError, AttributeError):
         return 0.0
+
+
+# =============================================================================
+# EXIT REASON DIAGNOSTICS
+# Each function inspects current OHLCV (and cross-screener state for trade tab)
+# to explain specifically WHY a ticker dropped out of that screener.
+# These are passed as callables to append_screener_exits() so the reason is
+# computed at the moment of first exit and stored permanently in persistence.json.
+# =============================================================================
+
+def _stage_exit_reason(ticker: str, saved_row: dict, ohlcv: dict) -> str:
+    """Why did this stock leave Stage Leaders? Check EMA structure breakdown."""
+    raw_key = _restore_ticker(ticker, ohlcv)
+    df = ohlcv.get(raw_key, pd.DataFrame())
+    if df.empty or "close" not in df.columns:
+        return "Stage criteria lost"
+
+    close = df["close"].dropna()
+    if len(close) < 50:
+        return "Stage criteria lost"
+
+    try:
+        ema21_s  = close.ewm(span=21,  adjust=False).mean()
+        ema50_s  = close.ewm(span=50,  adjust=False).mean()
+        ema200_s = close.ewm(span=200, adjust=False).mean()
+        price    = float(close.iloc[-1])
+        e21      = float(ema21_s.iloc[-1])
+        e50      = float(ema50_s.iloc[-1])
+        e200     = float(ema200_s.iloc[-1])
+        slope    = float(ema200_s.pct_change(10).iloc[-1]) * 100
+
+        parts = []
+        if price < e200:
+            pct_below = (e200 - price) / e200 * 100
+            parts.append(f"Price below EMA200 ({pct_below:.1f}%↓)")
+        elif slope < 0:
+            parts.append(f"EMA200 slope negative ({slope:.2f}%)")
+
+        if not (price > e50 > e21):
+            if price < e50:
+                pct = (e50 - price) / e50 * 100
+                parts.append(f"Price < EMA50 ({pct:.1f}%↓)")
+            elif e50 < e21:
+                parts.append("EMA50 < EMA21 — stack inverted")
+
+        # RS signal from the last saved row gives extra context
+        last_rs = str(saved_row.get("RS Status", ""))
+        if "Weak" in last_rs and not parts:
+            parts.append(f"RS weakened (was {last_rs})")
+
+        return " · ".join(parts) if parts else "Stage 2 criteria lost"
+    except Exception:
+        return "Stage 2 structure lost"
+
+
+def _sepa_exit_reason(ticker: str, saved_row: dict, ohlcv: dict) -> str:
+    """Why did this stock leave SEPA Setups? Check pivot distance and structure."""
+    raw_key = _restore_ticker(ticker, ohlcv)
+    df = ohlcv.get(raw_key, pd.DataFrame())
+    if df.empty or "close" not in df.columns:
+        return "Setup invalidated"
+
+    close = df["close"].dropna()
+    if len(close) < 20:
+        return "Setup invalidated"
+
+    try:
+        price   = float(close.iloc[-1])
+        high_20 = float(close.iloc[-20:].max())
+        dist    = (price - high_20) / high_20 * 100   # +ve = past pivot, -ve = below
+
+        # Stage break overrides everything
+        if len(close) >= 200:
+            e200 = float(close.ewm(span=200, adjust=False).mean().iloc[-1])
+            if price < e200:
+                pct = (e200 - price) / e200 * 100
+                return f"Stage 2 broken — {pct:.1f}% below EMA200"
+
+        if dist < -12:
+            return f"Base failed — {abs(dist):.1f}% below pivot"
+        if dist < -5:
+            return f"Pulled back {abs(dist):.1f}% below pivot"
+        if dist > 8:
+            return f"Extended {dist:+.1f}% past pivot — setup expired"
+
+        last_state = str(saved_row.get("Breakout State", ""))
+        last_score = saved_row.get("SEPA Score", "")
+        if last_state:
+            suffix = f" — score {last_score}" if last_score else ""
+            return f"Pivot zone left (was {last_state}{suffix})"
+        return "Pivot zone left — setup invalidated"
+    except Exception:
+        return "Setup invalidated"
+
+
+def _rs_exit_reason(ticker: str, saved_row: dict, ohlcv: dict,
+                    benchmark: pd.DataFrame) -> str:
+    """Why did this stock leave RS Leaders? Measure RS gap from 52w high."""
+    raw_key = _restore_ticker(ticker, ohlcv)
+    df = ohlcv.get(raw_key, pd.DataFrame())
+    if df.empty or "close" not in df.columns:
+        return "RS leadership lost"
+
+    close = df["close"].dropna()
+    bench = (benchmark["close"].dropna()
+             if benchmark is not None and not benchmark.empty
+             else pd.Series(dtype=float))
+
+    try:
+        price = float(close.iloc[-1])
+
+        # Stage breakdown is the most important signal
+        if len(close) >= 200:
+            e200 = float(close.ewm(span=200, adjust=False).mean().iloc[-1])
+            if price < e200:
+                pct = (e200 - price) / e200 * 100
+                return f"Stage 2 broken ({pct:.1f}% below EMA200) + RS dropped"
+
+        # RS line gap from 52-week RS high
+        if len(close) >= 60 and len(bench) >= 60:
+            aligned = pd.concat(
+                [close.rename("c"), bench.rename("b")], axis=1
+            ).dropna()
+            if len(aligned) >= 60:
+                c_a   = aligned["c"]
+                b_a   = aligned["b"]
+                rs_ln = (c_a / b_a) / (float(c_a.iloc[0]) / float(b_a.iloc[0])) * 100
+                window = min(252, len(rs_ln))
+                rs_52w = float(rs_ln.rolling(window, min_periods=60).max().iloc[-1])
+                rs_now = float(rs_ln.iloc[-1])
+                gap    = (rs_52w - rs_now) / rs_52w * 100   # % below 52w RS high
+                last   = saved_row.get("RS Score", "")
+                if gap > 15:
+                    return f"RS fell {gap:.1f}% from 52w high (score was {last})"
+                if gap > 5:
+                    return f"RS weakening — {gap:.1f}% below 52w RS high"
+
+        last_score = saved_row.get("RS Score", "")
+        return (f"RS score fell below threshold (was {last_score})"
+                if last_score else "RS score below threshold")
+    except Exception:
+        return "RS leadership lost"
+
+
+def _trade_exit_reason(ticker: str, saved_row: dict, ohlcv: dict,
+                       stage_df: pd.DataFrame, sepa_df: pd.DataFrame,
+                       rs_df: pd.DataFrame) -> str:
+    """
+    Why did this stock leave Trade Candidates?
+    Cross-references current screener outputs to identify which lens(es) dropped it,
+    then checks current OHLCV for breakout state context.
+    """
+    last_reason = str(saved_row.get("Reason", ""))
+    last_state  = str(saved_row.get("Breakout State", ""))
+    last_tier   = str(saved_row.get("Tier", ""))
+
+    def _has(df, t):
+        if df is None or df.empty or "Ticker" not in df.columns:
+            return False
+        return t in df["Ticker"].astype(str).values
+
+    in_stage = _has(stage_df, ticker)
+    in_sepa  = _has(sepa_df,  ticker)
+    in_rs    = _has(rs_df,    ticker)
+
+    # Identify which lenses this stock originally passed, and which it lost
+    had_stage = "Stage" in last_reason
+    had_sepa  = "SEPA"  in last_reason
+    had_rs    = "RS"    in last_reason
+
+    lost = []
+    if had_stage and not in_stage: lost.append("Stage 2")
+    if had_sepa  and not in_sepa:  lost.append("SEPA setup")
+    if had_rs    and not in_rs:    lost.append("RS leadership")
+
+    if lost:
+        still = []
+        if in_stage: still.append("Stage ✓")
+        if in_sepa:  still.append("SEPA ✓")
+        if in_rs:    still.append("RS ✓")
+        suffix = f" | still: {', '.join(still)}" if still else ""
+        return f"{' + '.join(lost)} lost{suffix}"
+
+    # If screener membership hasn't changed, diagnose from OHLCV pivot distance
+    raw_key = _restore_ticker(ticker, ohlcv)
+    df_ohlcv = ohlcv.get(raw_key, pd.DataFrame())
+    if not df_ohlcv.empty and "close" in df_ohlcv.columns:
+        close = df_ohlcv["close"].dropna()
+        if len(close) >= 20:
+            try:
+                price   = float(close.iloc[-1])
+                high_20 = float(close.iloc[-20:].max())
+                dist    = (price - high_20) / high_20 * 100
+                if last_state in ("BREAKOUT", "AT_PIVOT") and dist < -5:
+                    return f"Breakout failed — {abs(dist):.1f}% below pivot"
+                if dist > 10:
+                    return f"Extended {dist:+.1f}% — setup expired"
+            except Exception:
+                pass
+
+    if last_tier == "👁 Watchlist":
+        return (f"Watchlist — entry signal never fired (was: {last_reason})"
+                if last_reason else "Watchlist entry never triggered")
+    return (f"Score fell below top-{MAX_TRADE_CANDIDATES} threshold"
+            if not last_reason else f"Score dropped (was: {last_reason})")
 
 
 def _empty_trade_result() -> pd.DataFrame:
