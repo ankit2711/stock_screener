@@ -284,18 +284,29 @@ def append_screener_exits(
     # ── Step 2: stamp exit_date + reason for tickers that just dropped out ────
     # exit_reason can be a plain string OR callable(ticker, saved_row) -> str
     # so callers can pass OHLCV-based diagnostic logic per screener.
+    #
+    # Backfill: if a ticker was already exited (exit_date set) but has no
+    # reason stored yet (exited before this feature was deployed), compute and
+    # persist the reason now so it shows on this run rather than staying blank.
+    def _compute_reason(t: str, row: dict) -> str:
+        if callable(exit_reason):
+            try:
+                return exit_reason(t, row)
+            except Exception as _re:
+                logger.debug(f"exit_reason_fn failed for {t}: {_re}")
+                return "—"
+        return str(exit_reason)
+
     for ticker, rec in state.items():
-        if ticker not in active:
-            if rec.get("last_seen") and rec.get("exit_date") is None:
-                rec["exit_date"] = rec["last_seen"]
-                if callable(exit_reason):
-                    try:
-                        rec["exit_reason"] = exit_reason(ticker, rec.get("row", {}))
-                    except Exception as _re:
-                        logger.debug(f"exit_reason_fn failed for {ticker}: {_re}")
-                        rec["exit_reason"] = "Left scan"
-                else:
-                    rec["exit_reason"] = str(exit_reason)
+        if ticker not in active and rec.get("last_seen"):
+            if rec.get("exit_date") is None:
+                # First exit this run — stamp date and reason
+                rec["exit_date"]   = rec["last_seen"]
+                rec["exit_reason"] = _compute_reason(ticker, rec.get("row", {}))
+            elif not rec.get("exit_reason"):
+                # Already exited on a prior run but reason was never stored
+                # (feature was added after the exit) — backfill now
+                rec["exit_reason"] = _compute_reason(ticker, rec.get("row", {}))
 
     data[bucket] = state
     _save(data)
