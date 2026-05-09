@@ -1456,9 +1456,15 @@ def _rs_exit_reason(ticker: str, saved_row: dict, ohlcv: dict,
                 if gap > 5:
                     return f"RS weakening — {gap:.1f}% below 52w RS high"
 
+        # RS score dropped below the screener minimum (20) without a clear
+        # RS-line gap signal — show the actual number so it's actionable.
         last_score = saved_row.get("RS Score", "")
-        return (f"RS score fell below threshold (was {last_score})"
-                if last_score else "RS score below threshold")
+        if last_score:
+            try:
+                return f"RS score dropped to below 20 (was {float(last_score):.0f})"
+            except (ValueError, TypeError):
+                return f"RS score dropped below minimum (was {last_score})"
+        return "RS score dropped below minimum (20)"
     except Exception:
         return "RS leadership lost"
 
@@ -1522,8 +1528,11 @@ def _trade_exit_reason(ticker: str, saved_row: dict, ohlcv: dict,
     if last_tier == "👁 Watchlist":
         return (f"Watchlist — entry signal never fired (was: {last_reason})"
                 if last_reason else "Watchlist entry never triggered")
-    return (f"Score fell below top-{MAX_TRADE_CANDIDATES} threshold"
-            if not last_reason else f"Score dropped (was: {last_reason})")
+    last_score = saved_row.get("Trade Score", "")
+    score_str  = f" — score was {float(last_score):.0f}" if last_score else ""
+    return (f"Ranked out of top {MAX_TRADE_CANDIDATES}{score_str}"
+            if not last_reason
+            else f"Ranked out of top {MAX_TRADE_CANDIDATES}{score_str} (was: {last_reason})")
 
 
 def _empty_trade_result() -> pd.DataFrame:
