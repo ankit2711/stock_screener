@@ -260,6 +260,7 @@ OUTPUT_COLUMNS_TRADE_STAGE = [
     "Ticker",           # clickable → TradingView
     "Company",
     "Exit Date",        # blank while active; date when stock dropped out (kept 14 days)
+    "Exit Reason",      # why it left: e.g. "Stage 2 structure lost" / "EMA21 hold failed"
     "Score",            # composite Stage-2 score (0–1)
     "Stage",            # Stage 2 ↑ / Stage 1 / Stage 3 etc.
     "Stage Score S2",   # raw S2 score out of 10
@@ -281,6 +282,7 @@ OUTPUT_COLUMNS_TRADE_SEPA = [
     "Ticker",
     "Company",
     "Exit Date",        # blank while active; date when stock dropped out (kept 14 days)
+    "Exit Reason",      # why it left: e.g. "Setup invalidated" / "Breakout extended"
     "SEPA Score",       # primary ranking metric
     "Setup",            # 🟢/🟡/🔵/🔴 — action verdict at a glance
     "Breakout State",   # AT_PIVOT / BREAKOUT / WEAK_BREAKOUT / IN_BASE
@@ -307,6 +309,7 @@ OUTPUT_COLUMNS_RS = [
     "Ticker",
     "Company",
     "Exit Date",          # blank while active; date when stock dropped out (kept 14 days)
+    "Exit Reason",        # why it left: e.g. "RS leadership lost" / "Stage 2 broken"
     # ── Core RS signal ──────────────────────────────────────────────────────
     "RS Score",           # 0–100 composite RS Leader score
     "Resilience",         # Strong Leader / Leader / Neutral / Laggard
@@ -362,6 +365,7 @@ OUTPUT_COLUMNS_TRADE = [
     "Ticker",          # clickable → TradingView
     "Company",
     "Exit Date",       # blank while active; date when candidate dropped out (kept 14 days)
+    "Exit Reason",     # why it left: e.g. "RS or Stage criteria lost" / "Breakout extended"
     "Action",          # 🟢 BUY NOW / 🔔 BUY STOP / 🟡 CONFIRM VOL / 📋 ALERT
     "Entry ₹",         # exact price to enter
     "Stop ₹",          # hard stop-loss level
@@ -422,6 +426,7 @@ OUTPUT_COLUMNS_CONVICTION = [
     "Days Here",     # total calendar days since first entered the list
     "First Seen",    # date this stock first entered the conviction list
     "Left On",       # blank while active; exit date when stock dropped out of list
+    "Exit Reason",   # why it left: "Ranked out of top 20" / "RS + SEPA lost (1/3 remain)"
     "Action",        # 🟢 BUY NOW / 🔔 BUY STOP / 📋 SET ALERT / 👁 WATCHLIST / ⚪ Exited
     "# Signals",     # 2 or 3 — how many of {Stage2, RS, SEPA} are firing
     "Signals",       # "Stage ✓ | RS ✓ | SEPA ✓" — compact signal breakdown

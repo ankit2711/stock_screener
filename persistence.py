@@ -222,11 +222,13 @@ def get_all_active(bucket: str = "conviction") -> dict:
 
 
 def append_screener_exits(
-    df:       pd.DataFrame,
-    bucket:   str,
-    key_col:  str = "Ticker",
-    days:     int = 14,
-    exit_col: str = "Exit Date",
+    df:              pd.DataFrame,
+    bucket:          str,
+    key_col:         str = "Ticker",
+    days:            int = 14,
+    exit_col:        str = "Exit Date",
+    exit_reason:     str = "Left scan",
+    exit_reason_col: str = "Exit Reason",
 ) -> pd.DataFrame:
     """
     Generic exit tracker for any screener tab.
@@ -236,20 +238,23 @@ def append_screener_exits(
     bottom of the returned DataFrame.
 
     STATE STORED (in cache/persistence.json under `bucket`):
-      {ticker: {last_seen, exit_date, row: {col: val}}}
+      {ticker: {last_seen, exit_date, exit_reason, row: {col: val}}}
 
     The full row from the last active appearance is saved so exited rows
     still display their scores/signals from when they last qualified.
 
-    ACTIVE rows:  unchanged. `exit_col` column added as blank string.
-    EXITED rows:  appended at bottom; `exit_col` shows exit_date; Rank = "—".
+    ACTIVE rows:  unchanged. exit_col and exit_reason_col added as blank strings.
+    EXITED rows:  appended at bottom; exit_col shows exit_date; Rank = "—";
+                  exit_reason_col shows the reason stamped at time of exit.
 
     Args:
-        df:      current screener output DataFrame (must have `key_col` column)
-        bucket:  unique key per screener+market  e.g. "stage_india", "trade_us"
-        key_col: column holding ticker identifiers (default "Ticker")
-        days:    calendar days to keep exited rows visible (default 14)
-        exit_col: name of the column added to show exit date (default "Exit Date")
+        df:              current screener output DataFrame (must have key_col column)
+        bucket:          unique key per screener+market  e.g. "stage_india", "trade_us"
+        key_col:         column holding ticker identifiers (default "Ticker")
+        days:            calendar days to keep exited rows visible (default 14)
+        exit_col:        column name for exit date (default "Exit Date")
+        exit_reason:     short reason stamped when a ticker drops out (default "Left scan")
+        exit_reason_col: column name for the reason (default "Exit Reason")
 
     Returns:
         DataFrame — active rows (top) + exited rows (bottom), sorted by exit_date DESC.
@@ -268,24 +273,28 @@ def append_screener_exits(
     # ── Step 1: update active tickers — save full row ─────────────────────────
     for _, row in df.iterrows():
         ticker   = str(row[key_col])
-        row_dict = {k: v for k, v in row.to_dict().items() if k != exit_col}
+        row_dict = {k: v for k, v in row.to_dict().items()
+                    if k not in (exit_col, exit_reason_col)}
         rec = state.setdefault(ticker, {})
-        rec["last_seen"] = today
-        rec["exit_date"] = None      # still active — clear any prior exit stamp
-        rec["row"]       = row_dict
+        rec["last_seen"]   = today
+        rec["exit_date"]   = None   # still active — clear any prior exit stamp
+        rec["exit_reason"] = None   # clear on re-entry
+        rec["row"]         = row_dict
 
-    # ── Step 2: stamp exit_date for tickers that just dropped out ─────────────
+    # ── Step 2: stamp exit_date + reason for tickers that just dropped out ────
     for ticker, rec in state.items():
         if ticker not in active:
             if rec.get("last_seen") and rec.get("exit_date") is None:
-                rec["exit_date"] = rec["last_seen"]
+                rec["exit_date"]   = rec["last_seen"]
+                rec["exit_reason"] = exit_reason   # record WHY it left this screener
 
     data[bucket] = state
     _save(data)
 
-    # ── Step 3: add exit_col to active rows (blank = still active) ────────────
+    # ── Step 3: add exit_col + exit_reason_col to active rows (blank = active) ─
     df = df.copy()
-    df[exit_col] = ""
+    df[exit_col]        = ""
+    df[exit_reason_col] = ""
 
     # ── Step 4: build exited rows from saved state ────────────────────────────
     exited_rows = []
@@ -298,13 +307,14 @@ def append_screener_exits(
         try:
             ed_dt = date.fromisoformat(ed)
             if (today_dt - ed_dt).days > days:
-                continue             # too old — past the 14-day window
+                continue             # too old — past the window
         except Exception:
             continue
 
         saved_row = dict(rec.get("row", {}))
-        saved_row[exit_col] = ed
-        saved_row[key_col]  = ticker      # ensure ticker is present
+        saved_row[exit_col]         = ed
+        saved_row[exit_reason_col]  = rec.get("exit_reason") or exit_reason
+        saved_row[key_col]          = ticker      # ensure ticker is present
 
         # Stale rank is misleading — blank it out for exited rows
         if "Rank" in saved_row:

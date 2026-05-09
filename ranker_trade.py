@@ -299,10 +299,22 @@ def run_trade_scan(
     # daily dated tabs) so this provides rolling history without tab proliferation.
     logger.info("TRADE SCAN: Appending 14-day exit history to screener tabs...")
     try:
-        stage_df  = append_screener_exits(stage_df,  bucket=f"stage_{market}")
-        sepa_df   = append_screener_exits(sepa_df,   bucket=f"sepa_{market}")
-        rs_df     = append_screener_exits(rs_df,     bucket=f"rs_{market}")
-        trade_df  = append_screener_exits(trade_df,  bucket=f"trade_{market}")
+        stage_df = append_screener_exits(
+            stage_df, bucket=f"stage_{market}",
+            exit_reason="Stage 2 structure lost",
+        )
+        sepa_df  = append_screener_exits(
+            sepa_df,  bucket=f"sepa_{market}",
+            exit_reason="Setup invalidated",
+        )
+        rs_df    = append_screener_exits(
+            rs_df,    bucket=f"rs_{market}",
+            exit_reason="RS leadership lost",
+        )
+        trade_df = append_screener_exits(
+            trade_df, bucket=f"trade_{market}",
+            exit_reason="Left trade candidates",
+        )
     except Exception as _ee:
         logger.warning(f"TRADE SCAN: Exit history append failed (non-fatal): {_ee}")
 

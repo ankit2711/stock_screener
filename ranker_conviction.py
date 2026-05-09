@@ -162,6 +162,11 @@ def run_conviction_scan(
     if not candidates:
         return pd.DataFrame()
 
+    # Capture ALL tickers that fired ≥ MIN_SIGNALS BEFORE the top-20 cut.
+    # Used below to distinguish "ranked out" (still qualifies) from "signals
+    # dropped" (no longer fires 2+ signals) in the exit reason column.
+    all_qualifier_tickers = {row["Ticker"] for row in candidates}
+
     df_out = pd.DataFrame(candidates)
     # Sort by Conviction DESC, then ROC 5D % DESC as tiebreaker.
     # On strong market days many stocks score conviction=100; without a tiebreaker
@@ -223,6 +228,14 @@ def run_conviction_scan(
                 except Exception:
                     pass   # stick with persistence fallback
 
+            # ── Exit reason ───────────────────────────────────────────────────
+            # "Ranked out" = still fires 2+ signals but didn't make the top-20.
+            # Otherwise diagnose which signals are still active vs dropped.
+            if t in all_qualifier_tickers:
+                reason_str = "Ranked out of top 20"
+            else:
+                reason_str = _conviction_exit_reason(e["ticker"], ohlcv, bench_close)
+
             exited_rows.append({
                 "Ticker":       t,
                 "Company":      e["company"],
@@ -241,6 +254,7 @@ def run_conviction_scan(
                 "First Seen":   e["first_seen"],
                 "Days Here":    e["days_here"],
                 "Left On":      e["exit_date"],
+                "Exit Reason":  reason_str,
             })
 
     if exited_rows:
@@ -446,6 +460,84 @@ def _score_stock(
 # =============================================================================
 # HELPERS
 # =============================================================================
+
+def _conviction_exit_reason(raw_ticker: str, ohlcv: dict,
+                             bench_close: pd.Series) -> str:
+    """
+    Diagnose why a stock no longer fires 2+ conviction signals.
+
+    Re-runs the three signal checks (Stage2 / RS / SEPA) on current ohlcv
+    and returns a compact reason string, e.g.:
+      "RS + SEPA lost (1/3 remain)"
+      "All signals off"
+      "Stage lost (2/3 remain)"
+    Falls back to "Signals dropped" if data is unavailable.
+    """
+    t = raw_ticker.replace(".NS", "").replace(".BO", "")
+
+    # Locate the ohlcv key (try raw, then with suffix variants)
+    raw_key = raw_ticker
+    if raw_key not in ohlcv:
+        for suffix in (".NS", ".BO", ""):
+            candidate = t + suffix
+            if candidate in ohlcv:
+                raw_key = candidate
+                break
+    if raw_key not in ohlcv:
+        return "No data"
+
+    df = ohlcv[raw_key]
+    close = df["close"].dropna()
+    if len(close) < MIN_BARS:
+        return "Insufficient history"
+
+    try:
+        ema21  = close.ewm(span=21,  adjust=False).mean()
+        ema50  = close.ewm(span=50,  adjust=False).mean()
+        ema200 = close.ewm(span=200, adjust=False).mean()
+
+        price  = float(close.iloc[-1])
+        e21    = float(ema21.iloc[-1])
+        e50    = float(ema50.iloc[-1])
+        e200   = float(ema200.iloc[-1])
+        slope  = float(ema200.pct_change(10).iloc[-1]) * 100
+
+        stage2 = price > e200 and slope > 0 and price > e50 > e21
+
+        rs_on = False
+        if len(bench_close) >= 60:
+            aligned = pd.concat(
+                [close.rename("c"), bench_close.rename("b")], axis=1
+            ).dropna()
+            if len(aligned) >= 60:
+                c_a   = aligned["c"]
+                b_a   = aligned["b"]
+                rs_ln = (c_a / b_a) / (float(c_a.iloc[0]) / float(b_a.iloc[0])) * 100
+                window = min(252, len(rs_ln))
+                rs_52w = float(rs_ln.rolling(window, min_periods=60).max().iloc[-1])
+                rs_now = float(rs_ln.iloc[-1])
+                rs_on  = (rs_now / rs_52w) >= RS_HIGH_THRESHOLD
+
+        high_20 = float(close.iloc[-20:].max()) if len(close) >= 20 else price
+        ratio   = price / high_20
+        sepa_on = SEPA_LOWER_BOUND <= ratio <= SEPA_UPPER_BOUND
+
+        n_active = int(stage2) + int(rs_on) + int(sepa_on)
+
+        # Should not happen (would be in all_qualifier_tickers), but guard anyway
+        if n_active >= MIN_SIGNALS:
+            return "Ranked out of top 20"
+
+        lost = [name for name, on in
+                [("Stage", stage2), ("RS", rs_on), ("SEPA", sepa_on)] if not on]
+
+        if n_active == 0:
+            return "All signals off"
+        return f"{' + '.join(lost)} lost ({n_active}/3 remain)"
+
+    except Exception:
+        return "Signals dropped"
+
 
 def _avg_dollar_vol(df: pd.DataFrame, n: int = 20) -> float:
     """Average daily traded value over last n bars."""
