@@ -1316,7 +1316,15 @@ def _pct_val(v) -> float:
 # =============================================================================
 
 def _stage_exit_reason(ticker: str, saved_row: dict, ohlcv: dict) -> str:
-    """Why did this stock leave Stage Leaders? Check EMA structure breakdown."""
+    """
+    Why did this stock leave Stage Leaders?
+
+    Stage 2 bullish EMA stack: Price > EMA21 > EMA50 > EMA200, EMA200 slope > 0.
+    EMA21 (fast, 1-month) sits ABOVE EMA50 (slow, 2.5-month) in an uptrend
+    because recent prices are higher — fast-above-slow is bullish.
+    When EMA21 drops below EMA50, the short-term trend has reversed through
+    the medium-term trend: that is the bearish cross we flag.
+    """
     raw_key = _restore_ticker(ticker, ohlcv)
     df = ohlcv.get(raw_key, pd.DataFrame())
     if df.empty or "close" not in df.columns:
@@ -1337,20 +1345,26 @@ def _stage_exit_reason(ticker: str, saved_row: dict, ohlcv: dict) -> str:
         slope    = float(ema200_s.pct_change(10).iloc[-1]) * 100
 
         parts = []
+
+        # Gate 1 — price vs EMA200 (most important)
         if price < e200:
-            pct_below = (e200 - price) / e200 * 100
-            parts.append(f"Price below EMA200 ({pct_below:.1f}%↓)")
-        elif slope < 0:
+            pct = (e200 - price) / e200 * 100
+            parts.append(f"Price below EMA200 ({pct:.1f}% under)")
+        if slope < 0:
             parts.append(f"EMA200 slope negative ({slope:.2f}%)")
 
-        if not (price > e50 > e21):
-            if price < e50:
-                pct = (e50 - price) / e50 * 100
-                parts.append(f"Price < EMA50 ({pct:.1f}%↓)")
-            elif e50 < e21:
-                parts.append("EMA50 < EMA21 — stack inverted")
+        # Gate 2 — EMA stack: healthy uptrend = EMA21 > EMA50 (fast above slow)
+        if e21 < e50:
+            # Short-term MA has crossed below medium-term MA — trend weakening
+            pct = (e50 - e21) / e50 * 100
+            parts.append(f"EMA21 below EMA50 ({pct:.1f}% gap — short-term trend broken)")
 
-        # RS signal from the last saved row gives extra context
+        # Gate 3 — price vs EMA21
+        if price < e21:
+            pct = (e21 - price) / e21 * 100
+            parts.append(f"Price below EMA21 ({pct:.1f}% under)")
+
+        # RS context from last saved row when EMA structure is still intact
         last_rs = str(saved_row.get("RS Status", ""))
         if "Weak" in last_rs and not parts:
             parts.append(f"RS weakened (was {last_rs})")

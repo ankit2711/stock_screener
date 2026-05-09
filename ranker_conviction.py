@@ -328,7 +328,10 @@ def _score_stock(
     # ── Signal 1: Stage2 ──────────────────────────────────────────────────────
     above_ema200    = price > e200
     slope_positive  = slope_10d > 0
-    ema_stack       = price > e50 > e21      # full bullish alignment
+    # Bullish EMA stack: Price > EMA21 > EMA50 (fast above slow).
+    # EMA21 (1-month, fast) sits above EMA50 (2.5-month, slow) in an uptrend
+    # because recent prices are higher than older ones. Fast-above-slow = bullish.
+    ema_stack       = price > e21 > e50
 
     stage2_on = above_ema200 and slope_positive and ema_stack
     if stage2_on:
@@ -502,7 +505,7 @@ def _conviction_exit_reason(raw_ticker: str, ohlcv: dict,
         e200   = float(ema200.iloc[-1])
         slope  = float(ema200.pct_change(10).iloc[-1]) * 100
 
-        stage2 = price > e200 and slope > 0 and price > e50 > e21
+        stage2 = price > e200 and slope > 0 and price > e21 > e50
 
         rs_on = False
         if len(bench_close) >= 60:
