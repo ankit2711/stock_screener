@@ -744,22 +744,44 @@ def _build_tier_a_stage_rs(
         if ticker in exclude:
             continue
 
+        # ── Detect entry type early — needed for Gate 2 bypass ───────────────
+        entry_signal = str(row.get("Entry Signal", ""))
+        is_cheat     = "Cheat Entry" in entry_signal
+
         # ── Gate 2: RS confirmation ───────────────────────────────────────────
-        # Primary: stock appears in RS Leaders top-30 (two-lens confirmation).
-        # Fallback: Stage2 fast mover — RS is RISING in Stage output but the
+        # BYPASS for Cheat Entry:
+        #   "Cheat Entry" is the Stage screener's highest-conviction signal —
+        #   an established Stage 2 leader pulling back to EMA21. It already
+        #   implies RS leadership by definition. Requiring an additional RS
+        #   gate here creates a false negative for stocks that temporarily
+        #   dropped out of RS Leaders (e.g. RS score dipped below threshold
+        #   during the pullback while still showing Stage 2 leadership).
+        #
+        # Primary (non-cheat): stock appears in RS Leaders pool (two-lens confirmation).
+        # Fallback (non-cheat): Stage2 fast mover — RS is RISING in Stage output but the
         #   stock hasn't yet earned RS Leader status (takes 13–26 weeks to build).
-        #   These are the "moved fast into Stage 2 and running" stocks.
-        #   Accepted only if Stage output shows RS Strong + clean entry + momentum.
+        #   BUG FIX: Stage screener outputs "Strong ↑" / "Moderate ↑", NOT "RS Strong".
+        #   Previous check ("RS Strong" in _rs_status) never matched → fallback was dead.
         rs_row       = rs_map_local.get(ticker)
         is_rs_leader = rs_row is not None
         rs_pts       = 0.0
 
         if is_rs_leader:
             rs_pts = float(rs_row.get("RS Score", 0))
+        elif is_cheat:
+            # Cheat Entry bypasses RS gate — use stage RS score as proxy
+            _rs_status_cheat = str(row.get("RS Status", ""))
+            if "Strong ↑" in _rs_status_cheat:
+                rs_pts = 60.0   # established leader, RS temporarily dipped
+            elif "Moderate ↑" in _rs_status_cheat:
+                rs_pts = 48.0   # still rising, RS softening
+            else:
+                rs_pts = 38.0   # weakening RS — reflected in lower score
         else:
             _rs_status = str(row.get("RS Status",    ""))
             _momentum  = str(row.get("Momentum",     ""))
-            _has_rs    = "RS Strong" in _rs_status
+            # BUG FIX: Stage screener uses "Strong ↑" / "Moderate ↑", not "RS Strong"
+            _has_rs    = "Strong ↑" in _rs_status or "Moderate ↑" in _rs_status
             _has_mom   = "↑" in _momentum      # ↑↑ Strong or ↑ Rising
             # _has_entry gate REMOVED: it required "Near Pivot" or "Cheat Entry"
             # which excluded stocks that ARE breaking out (entry = "⚪ Extended"
@@ -795,8 +817,7 @@ def _build_tier_a_stage_rs(
         ema21 = float(close_series.ewm(span=21, adjust=False).mean().iloc[-1])
 
         # ── Detect which sub-path applies ─────────────────────────────────────
-        entry_signal = str(row.get("Entry Signal", ""))
-        is_cheat     = "Cheat Entry" in entry_signal
+        # (entry_signal and is_cheat already set above at Gate 2 detection)
 
         if is_cheat:
             # ══════════════════════════════════════════════════════════════════
@@ -916,11 +937,19 @@ def _build_tier_a_stage_rs(
             setup_str = entry_signal if is_cheat else f"RS Leader | Stage2 | {entry_signal}"
             path_str  = "Stage2+RS+Cheat" if is_cheat else "Stage2+RS"
         else:
-            # Fast-mover path: Stage2 + RS rising but not yet in RS Leaders top-30
-            reason    = "Stage2 + Momentum (Cheat)" if is_cheat else "Stage2 + Momentum"
-            setup_str = entry_signal if is_cheat else f"Momentum | Stage2 | {entry_signal}"
-            path_str  = "Stage2+Momentum"
-            score     = min(score, 68.0)   # cap: fresh movers rank below established RS Leaders
+            # Fast-mover / cheat-entry path: Stage2 + RS rising but not in RS Leaders pool
+            if is_cheat:
+                # Cheat Entry is an established Stage 2 leader — never cap below a genuine
+                # RS Leader. No ceiling here; the score reflects actual setup quality.
+                reason    = "Stage2 Cheat Entry"
+                setup_str = entry_signal
+                path_str  = "Stage2+Cheat"
+            else:
+                # Genuinely unproven fast mover — cap below established RS Leaders
+                reason    = "Stage2 + Momentum"
+                setup_str = f"Momentum | Stage2 | {entry_signal}"
+                path_str  = "Stage2+Momentum"
+                score     = min(score, 68.0)   # cap: fresh movers rank below established RS Leaders
 
         weekly_label = (
             "W-Confirmed" if weekly_stage_str == "W-S2 ✓"
