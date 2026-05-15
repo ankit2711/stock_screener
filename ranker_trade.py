@@ -18,7 +18,7 @@
 #
 #   Path 1 — SEPA Entry (original):
 #     Active entry signal (BREAKOUT / AT_PIVOT / WEAK_BREAKOUT) from SEPA scan
-#     Passes hard gates (stop ≤ 9%, pivot dist -8% to +5%)
+#     Passes hard gates (stop ≤ 11%, pivot dist -8% to +5%)
 #     Weekly gate: weekly close must be > weekly EMA200 (W-S2 or W-S3 only)
 #       W-S1 Accum / W-S4 Decline → demoted to Tier B (price below weekly EMA)
 #     Score boost: +10 pts if weekly EMA200 slope is also rising (W-S2 ✓)
@@ -68,6 +68,7 @@ from first_seen import annotate_df
 from persistence import annotate_streak_df
 from screeners.stage_analysis import StageAnalysisConfig
 from screeners.sepa import SEPAConfig, detect_base
+from screeners.weekly_stage import compute_thewrap_signal as _compute_thewrap, to_weekly as _to_weekly_ohlcv
 from screeners.sector_rotation import (
     run_sector_rotation,
     get_sector_for_ticker,
@@ -578,10 +579,14 @@ def _build_tier_a(sepa_df: pd.DataFrame, stage_map: dict, rs_map: dict,
         stage_norm = min(s2_pts / 10.0, 1.0)
 
         rs_pts    = float(rs_row.get("RS Score", 0))
-        rs_norm   = rs_pts / 100.0
+        rs_norm   = min(rs_pts / 100.0, 1.0)   # BUG FIX: RS score can exceed 100; cap at 1.0
 
-        state_norm = {"BREAKOUT": 1.0, "AT_PIVOT": 0.90, "WEAK_BREAKOUT": 0.55}.get(state, 0.3)
-        stop_norm  = min(max(0.0, (9.0 - stop_dist) / 6.0), 1.0)   # capped 0–1
+        # IN_BASE explicitly included (allowed by gate) — gets lower state bonus than WEAK_BREAKOUT
+        state_norm = {"BREAKOUT": 1.0, "AT_PIVOT": 0.90, "WEAK_BREAKOUT": 0.55, "IN_BASE": 0.20}.get(state, 0.20)
+        # BUG FIX: stop_norm was anchored at 9% (zero benefit) even though the hard gate was
+        # raised to 11%. Stops 9–11% passed the gate but scored 0. Now linearly mapped:
+        # 3% stop → 1.0, 11% stop → 0.0 (matching the full valid range 3–11%).
+        stop_norm  = min(max(0.0, (11.0 - stop_dist) / 8.0), 1.0)
 
         score = (
             sepa_norm  * weights["sepa"]  +
@@ -790,21 +795,19 @@ def _build_tier_a_stage_rs(
             # too extended past its structural pivot it fails there.
             if not (_has_rs and _has_mom):
                 continue   # no RS evidence or no momentum → skip
-            # Synthetic RS score: below RS Leader floor (65) — scored conservatively
-            rs_pts = 55.0 if "↑↑" in _rs_status else 42.0
+            # Synthetic RS score: below RS Leader floor (65) — scored conservatively.
+            # BUG FIX: rs_status values are "Strong ↑" / "Moderate ↑" — not "↑↑".
+            # The "↑↑" pattern only appears in mom_label, never in rs_status.
+            rs_pts = 55.0 if _rs_status == "Strong ↑" else 42.0 if _rs_status == "Moderate ↑" else 28.0
 
         # ── Gate 3: weekly stage — demote if price is below weekly EMA ───────
         weekly_stage_str = str(row.get("Weekly Stage", "Unknown"))
         if weekly_stage_str in ("W-S1 Accum", "W-S4 Decline"):
             continue
 
-        # ── Gate 4: TheWrap exit gates ────────────────────────────────────────
-        sepa_row = sepa_map.get(ticker, {})
-        tw_str   = str(sepa_row.get("TheWrap", "—"))
-        if any(x in tw_str for x in ("TW_FADING", "TW: Fading", "TW_EXIT", "TW: Exit")):
-            continue
-
-        # ── Gate 5: OHLCV ─────────────────────────────────────────────────────
+        # ── Gate 5 (moved up): OHLCV — needed before TheWrap computation ──────
+        # Moved before Gate 4 so we can compute TheWrap from daily data when
+        # the stock was not screened by SEPA (sepa_map has no entry for it).
         raw_df = ohlcv.get(_restore_ticker(ticker, ohlcv), pd.DataFrame())
         if raw_df.empty or len(raw_df) < 30:
             continue
@@ -815,6 +818,23 @@ def _build_tier_a_stage_rs(
 
         # EMA21 — structural reference for both cheat entry and stop
         ema21 = float(close_series.ewm(span=21, adjust=False).mean().iloc[-1])
+
+        # ── Gate 4: TheWrap exit gates ────────────────────────────────────────
+        # BUG FIX: when a stock is not in sepa_map (not SEPA-screened), sepa_row
+        # is {} and tw_str = "—" → gate never fires → stocks with TW_EXIT or
+        # TW_FADING bypass this check. Fix: compute TheWrap from OHLCV when the
+        # SEPA map has no entry.
+        sepa_row = sepa_map.get(ticker, {})
+        if sepa_row:
+            tw_str = str(sepa_row.get("TheWrap", "—"))
+        else:
+            try:
+                _tw_code, tw_label_computed, *_ = _compute_thewrap(_to_weekly_ohlcv(raw_df))
+                tw_str = tw_label_computed
+            except Exception:
+                tw_str = "—"
+        if any(x in tw_str for x in ("TW_FADING", "TW: Fading", "TW_EXIT", "TW: Exit")):
+            continue
 
         # ── Detect which sub-path applies ─────────────────────────────────────
         # (entry_signal and is_cheat already set above at Gate 2 detection)
@@ -891,9 +911,11 @@ def _build_tier_a_stage_rs(
         # ── Score ─────────────────────────────────────────────────────────────
         s2_pts     = float(row.get("Stage Score S2", 0))
         stage_norm = min(s2_pts / 10.0, 1.0)
-        rs_norm    = rs_pts / 100.0
+        rs_norm    = min(rs_pts / 100.0, 1.0)   # BUG FIX: cap at 1.0 (RS score can exceed 100)
         state_norm = {"BREAKOUT": 1.0, "AT_PIVOT": 0.90, "WEAK_BREAKOUT": 0.55}[state]
-        stop_norm  = min(max(0.0, (9.0 - stop_pct) / 6.0), 1.0)
+        # BUG FIX: stop_norm anchored at 9% even though gate allows up to 11%.
+        # Now linearly mapped: 3% → 1.0, 11% → 0.0
+        stop_norm  = min(max(0.0, (11.0 - stop_pct) / 8.0), 1.0)
 
         score = (
             stage_norm * w_stage +
@@ -1056,12 +1078,14 @@ def _build_tier_b(rs_df: pd.DataFrame, stage_map: dict, sepa_map: dict,
             0.5        * weights["state"]   # neutral state bonus
         ) * 100
 
-        # RSI from ohlcv if available
-        rsi = _quick_rsi(ohlcv.get(_restore_ticker(ticker, ohlcv), pd.DataFrame()))
-
-        # Price and pivot from RS output or stage output
-        price = float(stage_row.get("Price ₹", 0)) if "Price ₹" in stage_row else 0.0
-        pivot = _estimate_pivot(ohlcv.get(_restore_ticker(ticker, ohlcv), pd.DataFrame()), price)
+        # Price, RSI and pivot from OHLCV.
+        # BUG FIX: Stage ranker output has NO "Price ₹" column (only SEPA does).
+        # Reading price from stage_row always returned 0 → every Tier B entry showed
+        # "📋 ALERT — set pivot alert" with no price instead of an actual level.
+        raw_df_b = ohlcv.get(_restore_ticker(ticker, ohlcv), pd.DataFrame())
+        price    = float(raw_df_b["close"].iloc[-1]) if not raw_df_b.empty else 0.0
+        rsi      = _quick_rsi(raw_df_b)
+        pivot    = _estimate_pivot(raw_df_b, price)
 
         # Sector info — applied to score for ranking; no soft gate (already Watchlist)
         sector_res     = get_sector_for_ticker(ticker, metadata, sector_results, market)
@@ -1089,7 +1113,13 @@ def _build_tier_b(rs_df: pd.DataFrame, stage_map: dict, sepa_map: dict,
             "_company":      str(row.get("Company", ticker)),
             "_sector":       str(row.get("Sector",  "Unknown")),
             "_tv":           str(row.get("TradingView", "")),
-            "_weekly_stage": "—",
+            "_weekly_stage": str(row.get("Stage", "—")),    # RS output has Stage col
+            # Weekly label derived from RS Stage column (Stage 2 ≈ W-S2, etc.)
+            "_weekly_label": (
+                "W-Confirmed"  if "Stage 2" in str(row.get("Stage", ""))
+                else "W-S3 Pending" if "Stage 3" in str(row.get("Stage", ""))
+                else "W-Pending"
+            ),
             # RS Leads Price: 🌟 = RS at new high while price still in base (highest conviction)
             #                 ✓  = RS at new high with price also near high (confirming)
             "_rs_leading":   (
@@ -1137,10 +1167,10 @@ def _build_tier_b_stage(
 
     GATES:
       • Stage 2 confirmed (from stage_df)
-      • RS Status = "RS Strong ↑↑" or "RS Strong ↑" (rising even if not Leader)
-      • Momentum = "↑↑ Strong" or "↑ Rising"  (the stock is actually moving)
-      • Vol Conviction ≠ "Low"                 (not a quiet drift)
-      • Weekly stage not W-S1 / W-S4           (price above weekly EMA)
+      • RS Status = "Strong ↑" or "Moderate ↑"  (Stage screener's actual output values)
+      • Momentum contains "↑"                     (↑↑ Strong or ↑ Rising)
+      • Vol Conviction ≠ "Low"                    (not a quiet drift)
+      • Weekly stage not W-S1 / W-S4              (price above weekly EMA)
       • Not already in Tier A or Tier B (exclude set)
 
     SCORE:
@@ -1161,9 +1191,11 @@ def _build_tier_b_stage(
         if ticker in exclude:
             continue
 
-        # Must show rising RS strength in Stage output
+        # Must show rising RS strength in Stage output.
+        # BUG FIX: Stage screener emits "Strong ↑" / "Moderate ↑" — NOT "RS Strong".
+        # The old check ("RS Strong" not in rs_status) never matched → entire path dead.
         rs_status = str(row.get("RS Status", ""))
-        if "RS Strong" not in rs_status:
+        if rs_status not in ("Strong ↑", "Moderate ↑"):
             continue
 
         # Must show upward momentum
@@ -1188,8 +1220,8 @@ def _build_tier_b_stage(
         vol_norm   = 1.0 if "Very High" in vol_conv else (0.7 if "High" in vol_conv else 0.4)
 
         score = (stage_norm * 0.60 + mom_norm * 0.25 + vol_norm * 0.15) * 60.0
-        if "↑↑" in rs_status:
-            score += 5.0    # RS Strong ↑↑ gets a small boost over RS Strong ↑
+        if rs_status == "Strong ↑":
+            score += 5.0    # "Strong ↑" (strong + rising) gets a small boost over "Moderate ↑"
 
         # Sector multiplier
         sector_res     = get_sector_for_ticker(ticker, metadata, sector_results, market)
@@ -1219,7 +1251,12 @@ def _build_tier_b_stage(
             "_sector":       str(row.get("Sector",  "Unknown")),
             "_tv":           str(row.get("TradingView", "")),
             "_weekly_stage": weekly_stage_str,
-            "_weekly_label": "W-Confirmed" if weekly_stage_str == "W-S2 ✓" else "W-Pending",
+            # BUG FIX: W-S3 stocks were getting "W-Pending" instead of "W-S3 Pending"
+            "_weekly_label": (
+                "W-Confirmed"  if weekly_stage_str == "W-S2 ✓"
+                else "W-S3 Pending" if "W-S3" in weekly_stage_str
+                else "W-Pending"
+            ),
             "_tw_label":     "—",
             "_rs_leading":   "·",
             "_setup":        f"📋 Stage2 Momentum — {entry_signal}",
@@ -1270,8 +1307,9 @@ def _build_trade_output(candidates: list, market: str, regime_mult: float = 1.0)
         #   Bear        0.00    0.0%  — paper trade only
         raw_pos = min(1.0 / (risk_pct / 100), 0.08) * 100 if risk_pct > 0 else 5.0
         c_regime_mult = c.get("_regime_mult", regime_mult)
-        if c_regime_mult >= 0.85:   regime_factor = 1.00
-        elif c_regime_mult >= 0.60: regime_factor = 0.75
+        # BUG FIX: thresholds now match _get_regime_weights and slot allocation (0.90/0.65)
+        if c_regime_mult >= 0.90:   regime_factor = 1.00
+        elif c_regime_mult >= 0.65: regime_factor = 0.75
         elif c_regime_mult >= 0.40: regime_factor = 0.50
         elif c_regime_mult >= 0.22: regime_factor = 0.25
         else:                       regime_factor = 0.00
@@ -1359,9 +1397,17 @@ def _build_trade_output(candidates: list, market: str, regime_mult: float = 1.0)
 # =============================================================================
 
 def _get_regime_weights(regime_mult: float) -> dict:
-    """Map regime_mult to the appropriate weight set."""
-    if regime_mult >= 0.85:   return _REGIME_WEIGHTS["bull"]
-    if regime_mult >= 0.60:   return _REGIME_WEIGHTS["mild_bull"]
+    """
+    Map regime_mult to the appropriate weight set.
+
+    BUG FIX: thresholds now match the slot allocation thresholds and the discrete
+    values returned by get_market_regime() — 1.00 / 0.80 / 0.50 / 0.30 / 0.15.
+    Old thresholds (0.85 / 0.60) caused regime_mult=0.80 to get "bull" weights
+    (highest SEPA weight) while getting only "Mild Bull" slot count — a mismatch.
+    Now both functions use the same boundary set: 0.90 / 0.65 / 0.40 / 0.22.
+    """
+    if regime_mult >= 0.90:   return _REGIME_WEIGHTS["bull"]
+    if regime_mult >= 0.65:   return _REGIME_WEIGHTS["mild_bull"]
     if regime_mult >= 0.40:   return _REGIME_WEIGHTS["neutral"]
     if regime_mult >= 0.22:   return _REGIME_WEIGHTS["caution"]
     return _REGIME_WEIGHTS["bear"]
@@ -1681,6 +1727,9 @@ def _trade_exit_reason(ticker: str, saved_row: dict, ohlcv: dict,
 
 
 def _empty_trade_result() -> pd.DataFrame:
+    # BUG FIX: added "Sector Label" and "Sector ×" to match the schema of normally-built
+    # trade rows. Without these, pd.concat with exited rows (which have those columns)
+    # produces NaN-filled cells and sheet formatting errors.
     return pd.DataFrame([{
         "Rank": 1, "Tier": "—", "Reason": "—", "Ticker": "—",
         "Company": "No actionable setups found. Review again tomorrow.",
@@ -1688,5 +1737,7 @@ def _empty_trade_result() -> pd.DataFrame:
         "Risk %": "—", "Pos Size %": "—", "Trade Score": 0,
         "Stage S2": 0, "RS Score": 0, "SEPA Score": 0, "RSI(14)": "—",
         "Signal Summary": "No candidates passed all filters.",
-        "Breakout State": "—", "Regime ⚠": "—", "Sector": "—", "TradingView": "",
+        "Breakout State": "—", "Regime ⚠": "—",
+        "Sector": "—", "Sector Label": "—", "Sector ×": "—",
+        "TradingView": "",
     }])

@@ -195,7 +195,7 @@ def run_conviction_scan(
     # Show stocks that recently dropped out of the conviction list so the user
     # can see when they exited. Sorted by exit_date DESC (most recent first).
     active_tickers = set(df_out["Ticker"].tolist())
-    exits = get_recent_exits(bucket=_bucket, days=30)
+    exits = get_recent_exits(bucket=_bucket, days=30, data_as_of=get_data_as_of(benchmark))
     exited_rows = []
     for e in exits:
         t = e["ticker"].replace(".NS", "").replace(".BO", "")

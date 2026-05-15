@@ -216,16 +216,23 @@ def annotate_conviction_df(
 
 
 def get_recent_exits(
-    bucket: str = "conviction",
-    days:   int = 30,
+    bucket:      str           = "conviction",
+    days:        int           = 30,
+    data_as_of:  Optional[str] = None,
 ) -> list[dict]:
     """
     Return tickers that exited the conviction list within the last `days` calendar days.
     Sorted by exit_date descending (most recent first).
+
+    BUG FIX: added data_as_of parameter so the 30-day exit window is evaluated
+    relative to the OHLCV data date rather than wall-clock date.  Using date.today()
+    violates idempotency — re-running on the same data from a different calendar day
+    could drop exits from the window even though the underlying data hasn't changed.
+    Falls back to date.today() when data_as_of is not provided.
     """
     data  = _load()
     state = data.get(bucket, {})
-    today = date.today()
+    today = date.fromisoformat(data_as_of) if data_as_of else date.today()
     exits = []
 
     for ticker, rec in state.items():
