@@ -33,12 +33,44 @@ import json
 import logging
 from datetime import date
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
 _CACHE_FILE = Path("cache/persistence.json")
+
+
+def get_data_as_of(benchmark) -> str:
+    """
+    Return the date of the last available trading bar from a benchmark DataFrame.
+
+    WHY THIS EXISTS:
+      All streak/first_seen annotations must use the OHLCV data date, NOT
+      date.today().  If the script runs on Saturday with Friday's data and again
+      on Monday with the same Friday data, using date.today() would see a 2-day
+      gap and incorrectly increment the streak.  Using the last bar date means
+      both runs produce the same "today" → gap = 0 → streak unchanged.
+
+    Falls back to date.today().isoformat() if the benchmark is unavailable.
+
+    Usage (call once at the top of each run function, then pass data_as_of= to
+    annotate_streak_df / annotate_conviction_df / annotate_df / append_screener_exits):
+
+        data_as_of = get_data_as_of(benchmark)
+    """
+    try:
+        if benchmark is not None and hasattr(benchmark, "empty") and not benchmark.empty:
+            close = benchmark["close"].dropna()
+            if not close.empty:
+                last_idx = close.index[-1]
+                if hasattr(last_idx, "date"):
+                    return last_idx.date().isoformat()
+                return str(last_idx)[:10]
+    except Exception:
+        pass
+    return date.today().isoformat()
 
 
 def _load() -> dict:
@@ -68,8 +100,9 @@ def _save(data: dict) -> None:
 # =============================================================================
 
 def annotate_conviction_df(
-    df:     pd.DataFrame,
-    bucket: str = "conviction",
+    df:          pd.DataFrame,
+    bucket:      str = "conviction",
+    data_as_of:  Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Update streak state for every active ticker (those in df), mark exit_date
@@ -82,8 +115,12 @@ def annotate_conviction_df(
       Left On     — blank while active; last-seen date when streak breaks
 
     Args:
-        df:     active conviction DataFrame; must have "Ticker" column.
-        bucket: registry key (default "conviction").
+        df:          active conviction DataFrame; must have "Ticker" column.
+        bucket:      registry key (default "conviction").
+        data_as_of:  last OHLCV bar date (from get_data_as_of(benchmark)).
+                     Uses date.today() if not provided.
+                     IMPORTANT: pass this so that re-running with the same data
+                     on a different calendar day doesn't increment the streak.
 
     Returns:
         Annotated copy of df.
@@ -93,8 +130,10 @@ def annotate_conviction_df(
     if "Ticker" not in df.columns:
         return df
 
-    today    = date.today().isoformat()
-    today_dt = date.today()
+    # Use OHLCV data date, not run date — ensures idempotency when the same
+    # data is processed more than once (e.g. weekend re-runs, debug reruns).
+    today    = data_as_of or date.today().isoformat()
+    today_dt = date.fromisoformat(today)
     data     = _load()
     state    = data.setdefault(bucket, {})
     active   = {str(t) for t in df["Ticker"]}
@@ -120,7 +159,7 @@ def annotate_conviction_df(
             try:
                 gap = (today_dt - date.fromisoformat(last)).days
                 if gap == 0:
-                    pass           # same-day re-run — streak unchanged (don't double-count)
+                    pass           # same data re-run — streak unchanged
                 elif gap <= 3:
                     rec["streak"] = rec["streak"] + 1
                 else:
@@ -227,9 +266,10 @@ def get_all_active(bucket: str = "conviction") -> dict:
 
 
 def annotate_streak_df(
-    df:         pd.DataFrame,
-    bucket:     str,
-    ticker_col: str = "Ticker",
+    df:          pd.DataFrame,
+    bucket:      str,
+    ticker_col:  str = "Ticker",
+    data_as_of:  Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Annotate df with "Streak" and "First Entry" columns.
@@ -246,10 +286,14 @@ def annotate_streak_df(
     Separator / blank rows (ticker starts with "─") are skipped.
 
     Args:
-        df:         screener output DataFrame; must have ticker_col column.
-        bucket:     unique key per screener+market, e.g. "streak_stage_india".
-                    Use distinct buckets per market so India/US streaks don't mix.
-        ticker_col: column holding ticker identifiers (default "Ticker").
+        df:          screener output DataFrame; must have ticker_col column.
+        bucket:      unique key per screener+market, e.g. "streak_stage_india".
+                     Use distinct buckets per market so India/US streaks don't mix.
+        ticker_col:  column holding ticker identifiers (default "Ticker").
+        data_as_of:  last OHLCV bar date (from get_data_as_of(benchmark)).
+                     Uses date.today() if not provided.
+                     IMPORTANT: pass this so that re-running with the same data
+                     on a different calendar day doesn't increment the streak.
 
     Returns:
         df copy with "Streak" and "First Entry" columns inserted right after
@@ -260,8 +304,10 @@ def annotate_streak_df(
     if ticker_col not in df.columns:
         return df
 
-    today    = date.today().isoformat()
-    today_dt = date.today()
+    # Use OHLCV data date, not run date — ensures idempotency when the same
+    # data is processed more than once (e.g. weekend re-runs, debug reruns).
+    today    = data_as_of or date.today().isoformat()
+    today_dt = date.fromisoformat(today)
     data     = _load()
     state    = data.setdefault(bucket, {})
 
@@ -286,7 +332,7 @@ def annotate_streak_df(
             try:
                 gap = (today_dt - date.fromisoformat(last)).days
                 if gap == 0:
-                    pass           # same-day re-run — streak unchanged (don't double-count)
+                    pass           # same data re-run — streak unchanged
                 elif gap <= 3:
                     rec["streak"] = rec["streak"] + 1
                 else:
@@ -328,6 +374,7 @@ def append_screener_exits(
     exit_reason:     str = "Left scan",
     exit_reason_col: str = "Exit Reason",
     reentry_pool:    "pd.DataFrame | None" = None,
+    data_as_of:      Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Generic exit tracker for any screener tab.
@@ -361,6 +408,10 @@ def append_screener_exits(
                          This prevents the "ranked out of display but still in pool" false-exit
                          where a stock at rank 32 would otherwise be permanently stuck in the
                          exit section after one run outside the top-30 display window.
+        data_as_of:      last OHLCV bar date (from get_data_as_of(benchmark)).
+                         Uses date.today() if not provided. Pass this for full idempotency:
+                         exit_date and last_seen are stamped with the data date, not the
+                         run date, so re-running with the same data produces the same state.
 
     Returns:
         DataFrame — active rows (top) + exited rows (bottom), sorted by exit_date DESC.
@@ -370,8 +421,9 @@ def append_screener_exits(
     if key_col not in df.columns:
         return df
 
-    today    = date.today().isoformat()
-    today_dt = date.today()
+    # Use OHLCV data date, not run date — see get_data_as_of() for rationale.
+    today    = data_as_of or date.today().isoformat()
+    today_dt = date.fromisoformat(today)
     data     = _load()
     state    = data.setdefault(bucket, {})
     active   = {str(t) for t in df[key_col]}

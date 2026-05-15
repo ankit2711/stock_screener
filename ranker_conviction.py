@@ -61,7 +61,7 @@ from config import (
     MIN_AVG_DOLLAR_VOL_US,
     MIN_AVG_DOLLAR_VOL_AI,
 )
-from persistence import annotate_conviction_df, get_recent_exits
+from persistence import annotate_conviction_df, get_recent_exits, get_data_as_of
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +180,7 @@ def run_conviction_scan(
     _bucket = f"conviction_{market}"   # e.g. "conviction_india", "conviction_us"
 
     # Annotate with streak (updates persistence.json, adds Streak / First Seen / Days Here / Left On)
-    df_out = annotate_conviction_df(df_out, bucket=_bucket)
+    df_out = annotate_conviction_df(df_out, bucket=_bucket, data_as_of=get_data_as_of(benchmark))
 
     # Re-sort: streak DESC within same conviction band, then conviction DESC
     # Rationale: a stock at streak=7 has been confirmed for 7 days running —

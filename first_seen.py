@@ -88,21 +88,27 @@ def _clean_ticker(raw: str) -> str:
 # =============================================================================
 
 def annotate_df(
-    df:       pd.DataFrame,
-    screener: str,
+    df:          pd.DataFrame,
+    screener:    str,
+    data_as_of:  "str | None" = None,
 ) -> pd.DataFrame:
     """
     Stamp every ticker in *df* with its first-seen date for *screener*,
-    then add "First Reported" and "Days Listed" columns.
+    then add "First Entry" and "Days Listed" columns.
 
     Rules:
-    - First appearance → today's date, saved to registry.
-    - Subsequent appearances → original date kept, never overwritten.
+    - First appearance → data_as_of date saved to registry (never overwritten).
+    - Subsequent appearances → original date kept.
     - If Ticker column is absent or df is empty → returned unchanged.
 
     Args:
-        df:       screener result DataFrame; must have a "Ticker" column.
-        screener: registry key — "stage", "sepa", "rs", or "trade".
+        df:          screener result DataFrame; must have a "Ticker" column.
+        screener:    registry key — "stage", "sepa", "rs", or "trade".
+        data_as_of:  last OHLCV bar date string (YYYY-MM-DD).
+                     Uses date.today() if not provided.
+                     Pass this for idempotency — first_seen and Days Listed
+                     are anchored to the data date, not the run date, so
+                     re-running with the same data produces identical columns.
 
     Returns:
         A copy of df with two new columns appended.
@@ -112,8 +118,9 @@ def annotate_df(
     if "Ticker" not in df.columns:
         return df
 
-    today    = date.today().isoformat()          # "2026-05-02"
-    today_dt = date.today()
+    # Use OHLCV data date, not run date — ensures identical output on re-runs.
+    today    = data_as_of or date.today().isoformat()
+    today_dt = date.fromisoformat(today)
     registry = _load()
     bucket   = registry.setdefault(screener, {})
 

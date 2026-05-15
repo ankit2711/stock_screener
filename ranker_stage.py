@@ -34,7 +34,7 @@ import numpy as np
 from datetime import datetime
 
 from first_seen import annotate_df
-from persistence import annotate_streak_df
+from persistence import annotate_streak_df, get_data_as_of
 from screeners.stage_analysis import (
     StageAnalysisConfig, StageAnalysisResult, run_stage_analysis
 )
@@ -205,8 +205,9 @@ def run_screens_stage(
     df_out = pd.DataFrame(rows)
     df_out = df_out.sort_values("Score", ascending=False).reset_index(drop=True)
     df_out.insert(0, "Rank", range(1, len(df_out) + 1))
-    result = annotate_df(df_out.head(top_n), "stage")           # First Entry, Days Listed
-    result = annotate_streak_df(result, f"streak_stage_{market}")  # Streak
+    dao    = get_data_as_of(benchmark)
+    result = annotate_df(df_out.head(top_n), "stage", data_as_of=dao)
+    result = annotate_streak_df(result, f"streak_stage_{market}", data_as_of=dao)
     return result
 
 
@@ -405,8 +406,9 @@ def run_exit_monitor(
     # For holdings, streak = consecutive days this position has appeared in the
     # Holdings Alert. Resets if a position is sold and later re-entered.
     # First Entry ≈ first day after the stock was purchased (first scan day it appeared).
-    df_out = annotate_df(df_out, f"holdings_{market}")                  # First Entry, Days Listed
-    df_out = annotate_streak_df(df_out, f"streak_holdings_{market}")    # Streak
+    dao    = get_data_as_of(benchmark)
+    df_out = annotate_df(df_out, f"holdings_{market}", data_as_of=dao)
+    df_out = annotate_streak_df(df_out, f"streak_holdings_{market}", data_as_of=dao)
     return df_out
 
 

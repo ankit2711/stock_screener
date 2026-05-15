@@ -29,7 +29,7 @@ import numpy as np
 from datetime import datetime
 
 from first_seen import annotate_df
-from persistence import annotate_streak_df
+from persistence import annotate_streak_df, get_data_as_of
 from screeners.stage_analysis import StageAnalysisConfig, run_stage_analysis
 from screeners.sepa import SEPAConfig, SEPAResult, run_sepa_analysis
 from screeners.weekly_stage import (
@@ -257,8 +257,9 @@ def run_screens_sepa(
     df_out = pd.DataFrame(rows)
     df_out = df_out.sort_values("SEPA Score", ascending=False).reset_index(drop=True)
     df_out.insert(0, "Rank", range(1, len(df_out) + 1))
-    result = annotate_df(df_out.head(top_n), "sepa")              # First Entry, Days Listed
-    result = annotate_streak_df(result, f"streak_sepa_{market}")  # Streak
+    dao    = get_data_as_of(benchmark)
+    result = annotate_df(df_out.head(top_n), "sepa", data_as_of=dao)
+    result = annotate_streak_df(result, f"streak_sepa_{market}", data_as_of=dao)
     return result
 
 

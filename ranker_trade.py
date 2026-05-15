@@ -79,7 +79,7 @@ from ranker_stage      import run_screens_stage, DEFAULT_CFG as STAGE_CFG
 from ranker_rs         import run_screens_rs
 from ranker_conviction import run_conviction_scan
 from data_quality      import run_data_quality_scan
-from persistence       import append_screener_exits
+from persistence       import append_screener_exits, get_data_as_of
 from config import (
     TOP_N_INDIA, TOP_N_US, TOP_N_AI,
     POOL_N_INDIA, POOL_N_US, POOL_N_AI,
@@ -130,6 +130,13 @@ def run_trade_scan(
         Each value is a pd.DataFrame (empty DataFrame if no results).
     """
     logger.info("TRADE SCAN ▶ Starting unified 3-lens pipeline...")
+
+    # ── Step 0: Data-as-of — compute FIRST before any annotations ─────────────
+    # All streak / first_seen stamps must use the OHLCV data date, not run date.
+    # This ensures re-running with the same benchmark data (e.g. on a weekend or
+    # after a re-fetch that returned the same last bar) never changes streak counts.
+    data_as_of = get_data_as_of(benchmark)
+    logger.info(f"TRADE SCAN: Data as of {data_as_of}")
 
     # ── Step 1: Market regime ─────────────────────────────────────────────────
     regime_mult, regime_label = get_market_regime(benchmark)
@@ -341,8 +348,8 @@ def run_trade_scan(
         sorted(tier_b, key=lambda r: r["_score"], reverse=True)[:n_tier_b]
     )
     trade_df = _build_trade_output(all_candidates, market, regime_mult)
-    trade_df = annotate_df(trade_df, "trade")                           # First Entry, Days Listed
-    trade_df = annotate_streak_df(trade_df, f"streak_trade_{market}")   # Streak
+    trade_df = annotate_df(trade_df, "trade", data_as_of=data_as_of)
+    trade_df = annotate_streak_df(trade_df, f"streak_trade_{market}", data_as_of=data_as_of)
 
     logger.info(f"TRADE SCAN ✓ Returning {len(trade_df)} trade candidates")
 
@@ -399,41 +406,32 @@ def run_trade_scan(
             stage_df, bucket=f"stage_{market}",
             exit_reason=lambda t, row: _stage_exit_reason(t, row, ohlcv),
             reentry_pool=stage_pool,   # full pool so rank 31–80 stocks don't false-exit
+            data_as_of=data_as_of,
         )
         sepa_df  = append_screener_exits(
             sepa_df,  bucket=f"sepa_{market}",
             exit_reason=lambda t, row: _sepa_exit_reason(t, row, ohlcv),
             reentry_pool=sepa_pool,    # same — prevent false-exit for display-cutoff stocks
+            data_as_of=data_as_of,
         )
         rs_df    = append_screener_exits(
             rs_df,    bucket=f"rs_{market}",
             exit_reason=lambda t, row: _rs_exit_reason(t, row, ohlcv, benchmark),
             reentry_pool=rs_pool,      # same — RS Leaders pool is wider than display
+            data_as_of=data_as_of,
         )
         trade_df = append_screener_exits(
             trade_df, bucket=f"trade_{market}",
             exit_reason=lambda t, row: _trade_exit_reason(
                 t, row, ohlcv, _active_stage, _active_sepa, _active_rs
             ),
+            data_as_of=data_as_of,
         )
     except Exception as _ee:
         logger.warning(f"TRADE SCAN: Exit history append failed (non-fatal): {_ee}")
 
-    # ── Data As Of: last trading bar in the benchmark ────────────────────────────
-    # Tells you exactly which day's prices the screener used. Written to Run Log.
-    data_as_of = "unknown"
-    try:
-        if benchmark is not None and not benchmark.empty and "close" in benchmark.columns:
-            last_idx = benchmark["close"].dropna().index[-1]
-            data_as_of = (
-                last_idx.date().isoformat()
-                if hasattr(last_idx, "date")
-                else str(last_idx)[:10]
-            )
-    except Exception:
-        pass
-    logger.info(f"TRADE SCAN: Data as of {data_as_of}")
-
+    # data_as_of was computed at Step 0 (top of run_trade_scan) and used throughout.
+    # It is also returned so sheets_writer can write it to the Run Log.
     return {
         "stage":          stage_df,
         "sepa":           sepa_df,

@@ -34,7 +34,7 @@ import pandas as pd
 from datetime import datetime
 
 from first_seen import annotate_df
-from persistence import annotate_streak_df
+from persistence import annotate_streak_df, get_data_as_of
 from screeners.rs_leaders import RSLeaderResult, run_rs_leaders_analysis
 from config import (
     TOP_N_RS_INDIA, TOP_N_RS_US,
@@ -175,8 +175,9 @@ def run_screens_rs(
         .reset_index(drop=True)
     )
     df_out.insert(0, "Rank", range(1, len(df_out) + 1))
-    result = annotate_df(df_out.head(top_n), "rs")            # First Entry, Days Listed
-    result = annotate_streak_df(result, f"streak_rs_{market}")  # Streak
+    dao    = get_data_as_of(benchmark)
+    result = annotate_df(df_out.head(top_n), "rs", data_as_of=dao)
+    result = annotate_streak_df(result, f"streak_rs_{market}", data_as_of=dao)
     return result
 
 
