@@ -119,7 +119,12 @@ def annotate_conviction_df(
         else:
             try:
                 gap = (today_dt - date.fromisoformat(last)).days
-                rec["streak"] = rec["streak"] + 1 if gap <= 3 else 1
+                if gap == 0:
+                    pass           # same-day re-run — streak unchanged (don't double-count)
+                elif gap <= 3:
+                    rec["streak"] = rec["streak"] + 1
+                else:
+                    rec["streak"] = 1
             except Exception:
                 rec["streak"] = 1
 
@@ -221,6 +226,99 @@ def get_all_active(bucket: str = "conviction") -> dict:
     return {t: r for t, r in state.items() if r.get("exit_date") is None}
 
 
+def annotate_streak_df(
+    df:         pd.DataFrame,
+    bucket:     str,
+    ticker_col: str = "Ticker",
+) -> pd.DataFrame:
+    """
+    Annotate df with "Streak" and "First Entry" columns.
+
+    Streak     — consecutive calendar days this ticker has appeared in this
+                 screener's output.  Gap ≤ 3 days = consecutive (covers weekends).
+                 A stock in Stage Leaders for 15 days straight has been
+                 institutionally-confirmed in a Stage-2 uptrend for 3 weeks.
+
+    First Entry — date this ticker FIRST appeared in this screener bucket.
+                  Proxy for: first day in Stage 2 / first day in portfolio.
+
+    State stored in cache/persistence.json under the given bucket key.
+    Separator / blank rows (ticker starts with "─") are skipped.
+
+    Args:
+        df:         screener output DataFrame; must have ticker_col column.
+        bucket:     unique key per screener+market, e.g. "streak_stage_india".
+                    Use distinct buckets per market so India/US streaks don't mix.
+        ticker_col: column holding ticker identifiers (default "Ticker").
+
+    Returns:
+        df copy with "Streak" and "First Entry" columns inserted right after
+        the ticker_col position (or appended if ticker_col not found).
+    """
+    if df is None or (hasattr(df, "empty") and df.empty):
+        return df
+    if ticker_col not in df.columns:
+        return df
+
+    today    = date.today().isoformat()
+    today_dt = date.today()
+    data     = _load()
+    state    = data.setdefault(bucket, {})
+
+    # Build the set of active tickers, skipping separator rows
+    active = {
+        str(t) for t in df[ticker_col]
+        if str(t) and not str(t).startswith("─")
+    }
+
+    # ── Update active tickers ──────────────────────────────────────────────────
+    for ticker in active:
+        rec  = state.setdefault(ticker, {"streak": 0, "last_seen": None, "first_seen": today})
+        last = rec.get("last_seen")
+
+        # first_seen: stamp once, never overwrite
+        if not rec.get("first_seen"):
+            rec["first_seen"] = today
+
+        if last is None:
+            rec["streak"] = 1
+        else:
+            try:
+                gap = (today_dt - date.fromisoformat(last)).days
+                if gap == 0:
+                    pass           # same-day re-run — streak unchanged (don't double-count)
+                elif gap <= 3:
+                    rec["streak"] = rec["streak"] + 1
+                else:
+                    rec["streak"] = 1
+            except Exception:
+                rec["streak"] = 1
+
+        rec["last_seen"] = today
+
+    data[bucket] = state
+    _save(data)
+
+    # ── Annotate DataFrame ─────────────────────────────────────────────────────
+    df = df.copy()
+    streaks      = []
+    first_entries = []
+
+    for raw in df[ticker_col]:
+        t = str(raw)
+        if not t or t.startswith("─"):    # separator / blank row
+            streaks.append("")
+            first_entries.append("")
+        else:
+            rec = state.get(t, {})
+            streaks.append(rec.get("streak", 1))
+            first_entries.append(rec.get("first_seen", today))
+
+    df["Streak"]      = streaks
+    df["First Entry"] = first_entries
+    return df
+
+
 def append_screener_exits(
     df:              pd.DataFrame,
     bucket:          str,
@@ -229,6 +327,7 @@ def append_screener_exits(
     exit_col:        str = "Exit Date",
     exit_reason:     str = "Left scan",
     exit_reason_col: str = "Exit Reason",
+    reentry_pool:    "pd.DataFrame | None" = None,
 ) -> pd.DataFrame:
     """
     Generic exit tracker for any screener tab.
@@ -255,6 +354,13 @@ def append_screener_exits(
         exit_col:        column name for exit date (default "Exit Date")
         exit_reason:     short reason stamped when a ticker drops out (default "Left scan")
         exit_reason_col: column name for the reason (default "Exit Reason")
+        reentry_pool:    optional full pool DataFrame (e.g. the 80-stock pool when only
+                         top-30 are in df). Tickers present in the pool but not in df are
+                         still qualifying — their exit_date is cleared and their state is
+                         kept fresh, but they are NOT added to the displayed active rows.
+                         This prevents the "ranked out of display but still in pool" false-exit
+                         where a stock at rank 32 would otherwise be permanently stuck in the
+                         exit section after one run outside the top-30 display window.
 
     Returns:
         DataFrame — active rows (top) + exited rows (bottom), sorted by exit_date DESC.
@@ -270,7 +376,7 @@ def append_screener_exits(
     state    = data.setdefault(bucket, {})
     active   = {str(t) for t in df[key_col]}
 
-    # ── Step 1: update active tickers — save full row ─────────────────────────
+    # ── Step 1a: update displayed active tickers — save full row ─────────────
     for _, row in df.iterrows():
         ticker   = str(row[key_col])
         row_dict = {k: v for k, v in row.to_dict().items()
@@ -280,6 +386,35 @@ def append_screener_exits(
         rec["exit_date"]   = None   # still active — clear any prior exit stamp
         rec["exit_reason"] = None   # clear on re-entry
         rec["row"]         = row_dict
+
+    # ── Step 1b: pool-only tickers — still qualifying, just not in display ───
+    # When screeners use a pool (e.g. top-80) but only display the top-30,
+    # stocks ranked 31–80 are genuinely still Stage-2 / RS-leading / etc.
+    # We must clear their exit_date and update last_seen so they aren't
+    # wrongly shown in the exit section on subsequent runs.
+    # They are NOT appended to the displayed rows — only the display df is shown.
+    pool_tickers: set[str] = set()
+    if reentry_pool is not None and not reentry_pool.empty and key_col in reentry_pool.columns:
+        for _, prow in reentry_pool.iterrows():
+            pticker = str(prow[key_col])
+            if pticker in active:
+                continue   # already handled above
+            pool_tickers.add(pticker)
+            prow_dict = {k: v for k, v in prow.to_dict().items()
+                         if k not in (exit_col, exit_reason_col)}
+            rec = state.setdefault(pticker, {})
+            was_exited = rec.get("exit_date") is not None
+            rec["last_seen"]   = today
+            rec["exit_date"]   = None   # re-entered pool — clear exit stamp
+            rec["exit_reason"] = None
+            rec["row"]         = prow_dict
+            if was_exited:
+                logger.debug(
+                    f"{bucket}: {pticker} re-entered pool (rank > display cutoff) — exit cleared"
+                )
+
+    # All tickers considered "active" for exit-detection: display + pool
+    all_active = active | pool_tickers
 
     # ── Step 2: stamp exit_date + reason for tickers that just dropped out ────
     # exit_reason can be a plain string OR callable(ticker, saved_row) -> str
@@ -298,7 +433,7 @@ def append_screener_exits(
         return str(exit_reason)
 
     for ticker, rec in state.items():
-        if ticker not in active and rec.get("last_seen"):
+        if ticker not in all_active and rec.get("last_seen"):
             if rec.get("exit_date") is None:
                 # First exit this run — stamp date and reason
                 rec["exit_date"]   = rec["last_seen"]

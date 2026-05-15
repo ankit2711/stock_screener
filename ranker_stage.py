@@ -34,6 +34,7 @@ import numpy as np
 from datetime import datetime
 
 from first_seen import annotate_df
+from persistence import annotate_streak_df
 from screeners.stage_analysis import (
     StageAnalysisConfig, StageAnalysisResult, run_stage_analysis
 )
@@ -95,6 +96,7 @@ def run_screens_stage(
     benchmark: pd.DataFrame,
     market:    str = "india",
     cfg:       StageAnalysisConfig = None,
+    top_n:     int = None,          # override default TOP_N; used by trade ranker for larger pool
 ) -> pd.DataFrame:
     """
     Run stage analysis → filter Stage 2 only → rank by trend + entry quality.
@@ -104,7 +106,8 @@ def run_screens_stage(
     if cfg is None:
         cfg = DEFAULT_CFG
 
-    top_n  = TOP_N_AI if market == "ai" else TOP_N_US if market == "us" else TOP_N_INDIA
+    if top_n is None:
+        top_n = TOP_N_AI if market == "ai" else TOP_N_US if market == "us" else TOP_N_INDIA
     rows   = []
     total  = len(ohlcv)
     s2_count = 0
@@ -202,7 +205,9 @@ def run_screens_stage(
     df_out = pd.DataFrame(rows)
     df_out = df_out.sort_values("Score", ascending=False).reset_index(drop=True)
     df_out.insert(0, "Rank", range(1, len(df_out) + 1))
-    return annotate_df(df_out.head(top_n), "stage")
+    result = annotate_df(df_out.head(top_n), "stage")           # First Entry, Days Listed
+    result = annotate_streak_df(result, f"streak_stage_{market}")  # Streak
+    return result
 
 
 # =============================================================================
@@ -245,7 +250,8 @@ def run_exit_monitor(
     # Decimal places: INR rounds to integer, USD shows 2dp
     ema_fmt = lambda v: f"{ccy}{v:.0f}" if market == "india" else f"{ccy}{v:.2f}"
 
-    rows = []
+    rows        = []
+    analysed    = set()   # tickers that made it through the full analysis loop
     logger.info(
         f"Exit Monitor: scanning {len(holdings)} {market.upper()} holdings "
         f"(TheWrap — weekly 10W/20W/40W EMA)"
@@ -267,10 +273,11 @@ def run_exit_monitor(
             found_key = clean_ticker
 
         if df is None:
-            logger.debug(f"Exit Monitor: no OHLCV for holding '{clean_ticker}' — skipped")
+            logger.debug(f"Exit Monitor: no OHLCV for holding '{clean_ticker}' — skipped (no data)")
             continue
 
         if len(df) < 60:
+            logger.debug(f"Exit Monitor: insufficient history for '{clean_ticker}' ({len(df)} bars) — skipped")
             continue
 
         try:
@@ -321,23 +328,85 @@ def run_exit_monitor(
                 "TradingView": f"https://www.tradingview.com/chart/?symbol={tv_sym}",
                 "Last Updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
             })
+            analysed.add(clean_ticker)
 
         except Exception as e:
             logger.debug(f"Exit Monitor: analysis failed for '{clean_ticker}': {e}")
 
+    # ── Stub rows for holdings that could not be analysed ────────────────────
+    # Every portfolio position must appear in the sheet, even when OHLCV data
+    # is unavailable (SME stocks, thin names, not in the downloaded universe).
+    # These rows sort to the bottom (Urgency = -1) so analysed positions lead.
+    no_data_tickers = [t for t in holdings if t not in analysed]
+    for clean_ticker in no_data_tickers:
+        held_info    = holdings[clean_ticker]
+        company_name = held_info.get("name", "") or clean_ticker
+
+        # Best-effort Gain %: use change_pct from sheet if available, else buy price
+        gain_str = "—"
+        chg = held_info.get("change_pct")
+        if chg is not None:
+            gain_str = f"{chg:+.0f} %"
+        elif held_info.get("buy_price"):
+            gain_str = "—"   # can't compute without current price
+
+        if market == "india":
+            tv_sym = f"NSE:{clean_ticker}"
+        else:
+            tv_sym = clean_ticker
+
+        rows.append({
+            "Ticker":       clean_ticker,
+            "Company":      company_name,
+            "Portfolio":    held_info.get("portfolio", ""),
+            "Gain %":       gain_str,
+            "Action":       "⚪ No Data",
+            "Urgency":      -1,
+            "TheWrap":      "⚪ No Data",
+            "Signal Code":  "NO_DATA",
+            "10W EMA":      "—",
+            "20W EMA":      "—",
+            "40W EMA":      "—",
+            "vs 10W %":     "—",
+            "vs 20W %":     "—",
+            "vs 40W %":     "—",
+            "40W Slope":    "—",
+            "Weekly Stage": "—",
+            "TradingView":  f"https://www.tradingview.com/chart/?symbol={tv_sym}",
+            "Last Updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        })
+
     if not rows:
-        logger.info("Exit Monitor: no data found for any holding")
+        logger.info("Exit Monitor: no holdings data available for any position")
         return pd.DataFrame()
 
     df_out = pd.DataFrame(rows)
-    # Sort by urgency descending — most urgent action at the top
+    # Sort: analysed rows by urgency (highest first), then no-data rows at bottom
     df_out = df_out.sort_values("Urgency", ascending=False).reset_index(drop=True)
-    df_out.insert(0, "Rank", range(1, len(df_out) + 1))
 
+    # Build Rank with "—" for NO_DATA rows in one pass so the column is object
+    # dtype from the start.  pandas 3.x raises TypeError if you insert int64 and
+    # then try to assign a string via .loc[] — we avoid that entirely here.
+    no_data_mask = (df_out["Signal Code"] == "NO_DATA").values
+    ranks = [
+        "—" if is_no_data else (i + 1)
+        for i, is_no_data in enumerate(no_data_mask)
+    ]
+    df_out.insert(0, "Rank", ranks)
+
+    n_analysed  = len(analysed)
+    n_no_data   = len(no_data_tickers)
     logger.info(
-        f"Exit Monitor ✓  {len(df_out)} holdings analysed "
-        f"| most urgent: {df_out.iloc[0]['Signal Code']} ({df_out.iloc[0]['Ticker']})"
+        f"Exit Monitor ✓  {n_analysed} holdings analysed, {n_no_data} no-data stubs"
+        + (f" | most urgent: {df_out.iloc[0]['Signal Code']} ({df_out.iloc[0]['Ticker']})"
+           if n_analysed > 0 else "")
     )
+    # ── Streak + First Entry — track consecutive days each position has been held ──
+    # For holdings, streak = consecutive days this position has appeared in the
+    # Holdings Alert. Resets if a position is sold and later re-entered.
+    # First Entry ≈ first day after the stock was purchased (first scan day it appeared).
+    df_out = annotate_df(df_out, f"holdings_{market}")                  # First Entry, Days Listed
+    df_out = annotate_streak_df(df_out, f"streak_holdings_{market}")    # Streak
     return df_out
 
 

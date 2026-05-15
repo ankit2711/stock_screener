@@ -65,6 +65,7 @@ import numpy as np
 from datetime import datetime
 
 from first_seen import annotate_df
+from persistence import annotate_streak_df
 from screeners.stage_analysis import StageAnalysisConfig
 from screeners.sepa import SEPAConfig, detect_base
 from screeners.sector_rotation import (
@@ -79,12 +80,14 @@ from ranker_rs         import run_screens_rs
 from ranker_conviction import run_conviction_scan
 from data_quality      import run_data_quality_scan
 from persistence       import append_screener_exits
+from config import (
+    TOP_N_INDIA, TOP_N_US, TOP_N_AI,
+    POOL_N_INDIA, POOL_N_US, POOL_N_AI,
+)
 
 logger = logging.getLogger(__name__)
 
-MAX_TRADE_CANDIDATES = 15
-MAX_TIER_A = 8   # max "Trade Now" slots
-MAX_TIER_B = 7   # max "Watchlist" slots
+MAX_TRADE_CANDIDATES = 20   # upper bound (actual cap is regime-aware, see Step 7)
 
 # =============================================================================
 # REGIME WEIGHT TABLE
@@ -134,6 +137,11 @@ def run_trade_scan(
     logger.info(f"TRADE SCAN: Regime={regime_label} (×{regime_mult:.2f}) "
                 f"→ RS weight={weights['rs']:.0%}, SEPA weight={weights['sepa']:.0%}")
 
+    # Pool = large internal set fed into Trade Candidates scoring (see pool/display split below).
+    # Display = what goes to each screener tab (TOP_N).
+    pool_n = POOL_N_AI if market == "ai" else POOL_N_US if market == "us" else POOL_N_INDIA
+    disp_n = TOP_N_AI  if market == "ai" else TOP_N_US  if market == "us" else TOP_N_INDIA
+
     # ── Step 1b: Sector Rotation ──────────────────────────────────────────────
     # Run before the 3 scans so sector multipliers are ready when scoring starts.
     # Graceful: if sector rotation fails for any reason, sector_results = {}
@@ -156,32 +164,49 @@ def run_trade_scan(
             + traceback.format_exc()
         )
 
-    # ── Step 2: Run all 3 scans ───────────────────────────────────────────────
-    logger.info("TRADE SCAN: Running Stage scan...")
-    stage_df = _safe_run(run_screens_stage,
-                         ohlcv=ohlcv, metadata=metadata, benchmark=benchmark,
-                         market=market, cfg=STAGE_CFG)
+    # ── Step 2: Run all 3 scans — use LARGER POOL for Trade Candidate scoring ─
+    # Each screener is run with top_n=pool_n (80 India / 60 US) so we see
+    # 2–3× more candidates when building cross-screener maps.  The display
+    # tabs (Stage / SEPA / RS Leaders) are truncated to TOP_N after the maps
+    # are built — users still see a clean 30-stock tab.
+    logger.info(f"TRADE SCAN: Running Stage scan (pool={pool_n}, display={disp_n})...")
+    stage_pool = _safe_run(run_screens_stage,
+                           ohlcv=ohlcv, metadata=metadata, benchmark=benchmark,
+                           market=market, cfg=STAGE_CFG, top_n=pool_n)
 
-    logger.info("TRADE SCAN: Running SEPA scan...")
-    sepa_df = _safe_run(run_screens_sepa,
+    logger.info(f"TRADE SCAN: Running SEPA scan (pool={pool_n})...")
+    sepa_pool = _safe_run(run_screens_sepa,
+                          ohlcv=ohlcv, metadata=metadata, benchmark=benchmark,
+                          market=market, stage_cfg=SEPA_STAGE_CFG, sepa_cfg=_SEPA_CFG,
+                          top_n=pool_n)
+
+    logger.info(f"TRADE SCAN: Running RS Leaders scan (pool={pool_n})...")
+    rs_pool = _safe_run(run_screens_rs,
                         ohlcv=ohlcv, metadata=metadata, benchmark=benchmark,
-                        market=market, stage_cfg=SEPA_STAGE_CFG, sepa_cfg=_SEPA_CFG)
+                        market=market, top_n=pool_n)
 
-    logger.info("TRADE SCAN: Running RS Leaders scan...")
-    rs_df = _safe_run(run_screens_rs,
-                      ohlcv=ohlcv, metadata=metadata, benchmark=benchmark,
-                      market=market)
+    # Display DataFrames: truncated to TOP_N for screener tab output
+    stage_df = stage_pool.head(disp_n) if not stage_pool.empty else stage_pool
+    sepa_df  = sepa_pool.head(disp_n)  if not sepa_pool.empty  else sepa_pool
+    rs_df    = rs_pool.head(disp_n)    if not rs_pool.empty    else rs_pool
 
-    logger.info(f"TRADE SCAN: Stage={len(stage_df)}, SEPA={len(sepa_df)}, RS={len(rs_df)}")
+    logger.info(
+        f"TRADE SCAN: Pool  Stage={len(stage_pool)}, SEPA={len(sepa_pool)}, RS={len(rs_pool)} | "
+        f"Display Stage={len(stage_df)}, SEPA={len(sepa_df)}, RS={len(rs_df)}"
+    )
 
-    # ── Step 3: Build lookup maps keyed by clean ticker ──────────────────────
-    stage_map = _df_to_map(stage_df, "Ticker")
-    sepa_map  = _df_to_map(sepa_df,  "Ticker")
-    rs_map    = _df_to_map(rs_df,    "Ticker")
+    # ── Step 3: Build lookup maps from FULL POOL ──────────────────────────────
+    # Maps cover pool_n stocks — Trade Candidate scoring sees all of them,
+    # not just the 30 that appear in the display tab.
+    stage_map = _df_to_map(stage_pool, "Ticker")
+    sepa_map  = _df_to_map(sepa_pool,  "Ticker")
+    rs_map    = _df_to_map(rs_pool,    "Ticker")
 
-    # ── Step 4: Build Tier A — Path 1: SEPA entries ──────────────────────────
+    # ── Step 4: Build Tier A — Path 1: SEPA entries (iterate over FULL POOL) ──
+    # Using sepa_pool (not sepa_df) so stocks ranked 31–80 by base quality
+    # but near their pivot today are still seen by the Trade Candidates engine.
     tier_a = _build_tier_a(
-        sepa_df, stage_map, rs_map, weights, regime_label, regime_mult,
+        sepa_pool, stage_map, rs_map, weights, regime_label, regime_mult,
         sector_results=sector_results, metadata=metadata, market=market,
     )
     logger.info(f"TRADE SCAN: Tier A Path1 (SEPA)         = {len(tier_a)} candidates")
@@ -189,7 +214,7 @@ def run_trade_scan(
     # ── Step 4b: Tier A — Path 2: Stage2 + RS Leader (no SEPA base needed) ──
     tier_a_tickers = {r["_ticker"] for r in tier_a}
     tier_a_sr = _build_tier_a_stage_rs(
-        stage_df, rs_df, sepa_map, ohlcv,
+        stage_pool, rs_pool, sepa_map, ohlcv,
         weights, regime_label, regime_mult,
         exclude=tier_a_tickers,
         sector_results=sector_results, metadata=metadata, market=market,
@@ -200,7 +225,7 @@ def run_trade_scan(
 
     # ── Step 5: Build Tier B — RS Leaders in Stage 2 waiting for FTD ─────────
     tier_a_tickers = {r["_ticker"] for r in tier_a}   # refresh after path 2
-    tier_b = _build_tier_b(rs_df, stage_map, sepa_map, ohlcv, weights,
+    tier_b = _build_tier_b(rs_pool, stage_map, sepa_map, ohlcv, weights,
                            regime_label, exclude=tier_a_tickers, regime_mult=regime_mult,
                            sector_results=sector_results, metadata=metadata, market=market)
     logger.info(f"TRADE SCAN: Tier B (Watchlist)          = {len(tier_b)} candidates")
@@ -211,12 +236,44 @@ def run_trade_scan(
     # Without this step, these stocks are invisible in ALL candidate paths.
     all_tier_ab_tickers = {r["_ticker"] for r in tier_a} | {r["_ticker"] for r in tier_b}
     tier_b_stage = _build_tier_b_stage(
-        stage_df, exclude=all_tier_ab_tickers,
+        stage_pool, exclude=all_tier_ab_tickers,
         weights=weights, regime_label=regime_label, regime_mult=regime_mult,
         sector_results=sector_results, metadata=metadata, market=market,
     )
     tier_b.extend(tier_b_stage)
     logger.info(f"TRADE SCAN: Tier B Momentum supplement  = {len(tier_b_stage)} candidates")
+
+    # ── Step 5c: Conviction streak score boost ───────────────────────────────────
+    # Stocks that appear in Daily BUY for consecutive days are getting consistent
+    # institutional confirmation across ALL three lenses — that persistence is a
+    # genuine signal edge.  Apply a small bonus to their Trade Candidate score
+    # using the streak persisted from the PREVIOUS run (always available in
+    # cache/persistence.json, so it doesn't depend on this run's conviction scan).
+    #
+    #   Streak ≥ 15 days → +8 pts  (3 weeks of daily conviction — very high signal)
+    #   Streak ≥  7 days → +5 pts  (1.5 weeks — consistent signal)
+    #   Streak ≥  3 days → +2 pts  (just above weekend noise floor)
+    #
+    # The bonus is intentionally small so a stock with weak fundamentals can't
+    # leapfrog a genuinely better setup purely on streak. It breaks ties and
+    # slightly surfaces the most persistent setups.
+    try:
+        from persistence import get_all_active as _get_conv_active
+        _conv_streaks = {t: r.get("streak", 0)
+                         for t, r in _get_conv_active("conviction").items()}
+        for _cand in tier_a + tier_b:
+            _streak = _conv_streaks.get(_cand["_ticker"], 0)
+            if _streak >= 15:
+                _cand["_score"] = round(_cand["_score"] + 8.0, 1)
+            elif _streak >= 7:
+                _cand["_score"] = round(_cand["_score"] + 5.0, 1)
+            elif _streak >= 3:
+                _cand["_score"] = round(_cand["_score"] + 2.0, 1)
+        _boosted = sum(1 for c in tier_a + tier_b
+                       if _conv_streaks.get(c["_ticker"], 0) >= 3)
+        logger.info(f"TRADE SCAN: Conviction streak boost applied to {_boosted} candidates")
+    except Exception as _cse:
+        logger.debug(f"TRADE SCAN: Conviction streak boost skipped: {_cse}")
 
     # ── Step 6: Holdings Alert — TheWrap signals for held positions only ────────
     # Loads Om-Holdings and scans ONLY those positions (fast — 40-60 stocks vs 1500+).
@@ -246,13 +303,46 @@ def run_trade_scan(
 
     logger.info(f"TRADE SCAN: Holdings Alert — {len(holdings_alert_df)} positions analysed")
 
-    # ── Step 7: Combine, cap, rank ────────────────────────────────────────────
+    # ── Step 7: Combine, cap, rank — regime-aware slot counts ────────────────
+    # More slots in bull markets (more confirmed setups), fewer in bear markets
+    # (capital preservation — only the strongest ideas survive).
+    #
+    # IMPORTANT: thresholds are calibrated to the DISCRETE values returned by
+    # get_market_regime(): 1.00 (5/5), 0.80 (4/5), 0.50 (3/5), 0.30 (2/5), 0.15 (≤1/5).
+    # Previous thresholds (0.95/0.85/0.75/0.60) were misaligned — 0.80/0.50/0.30 all
+    # fell into "Bear" (< 0.60), hiding quality setups even in moderate corrections.
+    #
+    #   Regime            mult    Tier A   Tier B   Total
+    #   Bull   (5/5)      1.00      12       8       20
+    #   Mild   (4/5)      0.80      10       8       18
+    #   Neutral (3/5)     0.50       8       7       15
+    #   Caution (2/5)     0.30       5       5       10
+    #   Bear   (≤1/5)     0.15       3       4        7
+    if regime_mult >= 0.90:
+        n_tier_a, n_tier_b = 12, 8
+        regime_slots_label = "Bull (20 slots)"
+    elif regime_mult >= 0.65:
+        n_tier_a, n_tier_b = 10, 8
+        regime_slots_label = "Mild Bull (18 slots)"
+    elif regime_mult >= 0.40:
+        n_tier_a, n_tier_b = 8, 7
+        regime_slots_label = "Neutral (15 slots)"
+    elif regime_mult >= 0.22:
+        n_tier_a, n_tier_b = 5, 5
+        regime_slots_label = "Caution (10 slots)"
+    else:
+        n_tier_a, n_tier_b = 3, 4
+        regime_slots_label = "Bear (7 slots)"
+
+    logger.info(f"TRADE SCAN: Regime slot allocation → {regime_slots_label}")
+
     all_candidates = (
-        sorted(tier_a, key=lambda r: r["_score"], reverse=True)[:MAX_TIER_A] +
-        sorted(tier_b, key=lambda r: r["_score"], reverse=True)[:MAX_TIER_B]
+        sorted(tier_a, key=lambda r: r["_score"], reverse=True)[:n_tier_a] +
+        sorted(tier_b, key=lambda r: r["_score"], reverse=True)[:n_tier_b]
     )
     trade_df = _build_trade_output(all_candidates, market, regime_mult)
-    trade_df = annotate_df(trade_df, "trade")
+    trade_df = annotate_df(trade_df, "trade")                           # First Entry, Days Listed
+    trade_df = annotate_streak_df(trade_df, f"streak_trade_{market}")   # Streak
 
     logger.info(f"TRADE SCAN ✓ Returning {len(trade_df)} trade candidates")
 
@@ -267,9 +357,9 @@ def run_trade_scan(
             metadata  = metadata,
             benchmark = benchmark,
             market    = market,
-            stage_df  = stage_df,   # optional — for RS Signal / Weekly Stage enrichment
-            sepa_df   = sepa_df,
-            rs_df     = rs_df,
+            stage_df  = stage_pool,   # full pool (not display-30) so rank-35 stocks get enrichment
+            sepa_df   = sepa_pool,
+            rs_df     = rs_pool,      # critical: "🌟 RS Leads" annotation needs the full pool
         )
         n3 = int((conviction_df["# Signals"] == 3).sum()) if not conviction_df.empty else 0
         logger.info(
@@ -308,14 +398,17 @@ def run_trade_scan(
         stage_df = append_screener_exits(
             stage_df, bucket=f"stage_{market}",
             exit_reason=lambda t, row: _stage_exit_reason(t, row, ohlcv),
+            reentry_pool=stage_pool,   # full pool so rank 31–80 stocks don't false-exit
         )
         sepa_df  = append_screener_exits(
             sepa_df,  bucket=f"sepa_{market}",
             exit_reason=lambda t, row: _sepa_exit_reason(t, row, ohlcv),
+            reentry_pool=sepa_pool,    # same — prevent false-exit for display-cutoff stocks
         )
         rs_df    = append_screener_exits(
             rs_df,    bucket=f"rs_{market}",
             exit_reason=lambda t, row: _rs_exit_reason(t, row, ohlcv, benchmark),
+            reentry_pool=rs_pool,      # same — RS Leaders pool is wider than display
         )
         trade_df = append_screener_exits(
             trade_df, bucket=f"trade_{market}",
@@ -326,6 +419,21 @@ def run_trade_scan(
     except Exception as _ee:
         logger.warning(f"TRADE SCAN: Exit history append failed (non-fatal): {_ee}")
 
+    # ── Data As Of: last trading bar in the benchmark ────────────────────────────
+    # Tells you exactly which day's prices the screener used. Written to Run Log.
+    data_as_of = "unknown"
+    try:
+        if benchmark is not None and not benchmark.empty and "close" in benchmark.columns:
+            last_idx = benchmark["close"].dropna().index[-1]
+            data_as_of = (
+                last_idx.date().isoformat()
+                if hasattr(last_idx, "date")
+                else str(last_idx)[:10]
+            )
+    except Exception:
+        pass
+    logger.info(f"TRADE SCAN: Data as of {data_as_of}")
+
     return {
         "stage":          stage_df,
         "sepa":           sepa_df,
@@ -335,6 +443,7 @@ def run_trade_scan(
         "sectors":        sector_results,      # dict[str, SectorResult] — for display + JSON export
         "conviction":     conviction_df,       # Daily BUY — 2+ signal stocks with streak
         "data_quality":   data_quality_df,     # Data Issues — NaN / stale / spike tickers
+        "data_as_of":     data_as_of,          # last trading bar date in the benchmark feed
     }
 
 
@@ -1250,6 +1359,8 @@ def _safe_run(fn, **kwargs) -> pd.DataFrame:
     try:
         result = fn(**kwargs)
         return result if result is not None and not (hasattr(result, "empty") and result.empty) else pd.DataFrame()
+    except (KeyboardInterrupt, SystemExit):
+        raise   # never swallow — Ctrl+C must stop the run immediately
     except Exception as e:
         logger.warning(f"Screener {fn.__name__} failed: {e}")
         return pd.DataFrame()
@@ -1328,11 +1439,11 @@ def _stage_exit_reason(ticker: str, saved_row: dict, ohlcv: dict) -> str:
     raw_key = _restore_ticker(ticker, ohlcv)
     df = ohlcv.get(raw_key, pd.DataFrame())
     if df.empty or "close" not in df.columns:
-        return "Stage 2 — no OHLCV data available"
+        return ""   # blank = "not computed yet"; backfill will retry next run when data is available
 
     close = df["close"].dropna()
     if len(close) < 50:
-        return "Stage 2 — insufficient price history"
+        return ""   # same: insufficient history this run — retry next run
 
     try:
         ema21_s  = close.ewm(span=21,  adjust=False).mean()
@@ -1386,11 +1497,11 @@ def _sepa_exit_reason(ticker: str, saved_row: dict, ohlcv: dict) -> str:
     raw_key = _restore_ticker(ticker, ohlcv)
     df = ohlcv.get(raw_key, pd.DataFrame())
     if df.empty or "close" not in df.columns:
-        return "Setup invalidated"
+        return ""   # blank = retry next run; don't store "data unavailable" as permanent reason
 
     close = df["close"].dropna()
     if len(close) < 20:
-        return "Setup invalidated"
+        return ""   # same: insufficient history this run
 
     try:
         price   = float(close.iloc[-1])
@@ -1427,7 +1538,7 @@ def _rs_exit_reason(ticker: str, saved_row: dict, ohlcv: dict,
     raw_key = _restore_ticker(ticker, ohlcv)
     df = ohlcv.get(raw_key, pd.DataFrame())
     if df.empty or "close" not in df.columns:
-        return "RS leadership lost"
+        return ""   # blank = retry next run; don't store "data unavailable" as permanent reason
 
     close = df["close"].dropna()
     bench = (benchmark["close"].dropna()

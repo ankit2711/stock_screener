@@ -8,8 +8,8 @@ Each time a screener returns results, this module:
        • If seen before → keeps the original date
   3. Saves the updated registry
   4. Adds two columns to the DataFrame:
-       "First Reported"  — YYYY-MM-DD date string
-       "Days Listed"     — integer: today − first_reported (how long on the list)
+       "First Entry"  — YYYY-MM-DD date string (first time this stock appeared)
+       "Days Listed"  — integer: today − first_entry (how long on the list)
 
 Usage (called at the end of each screener):
     from first_seen import annotate_df
@@ -150,8 +150,8 @@ def annotate_df(
             logger.warning(f"first_seen: save failed ({e})")
 
     df = df.copy()
-    df["First Reported"] = first_reported
-    df["Days Listed"]    = days_listed
+    df["First Entry"] = first_reported   # renamed from "First Reported" — consistent with Streak tab
+    df["Days Listed"] = days_listed
     return df
 
 

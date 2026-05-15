@@ -34,6 +34,7 @@ import pandas as pd
 from datetime import datetime
 
 from first_seen import annotate_df
+from persistence import annotate_streak_df
 from screeners.rs_leaders import RSLeaderResult, run_rs_leaders_analysis
 from config import (
     TOP_N_RS_INDIA, TOP_N_RS_US,
@@ -52,6 +53,7 @@ def run_screens_rs(
     metadata:  dict,
     benchmark: pd.DataFrame,
     market:    str = "india",
+    top_n:     int = None,          # override default TOP_N; used by trade ranker for larger pool
 ) -> pd.DataFrame:
     """
     Run RS Leaders scan: find stocks with RS line near 52-week highs.
@@ -61,11 +63,13 @@ def run_screens_rs(
         metadata:  dict of {ticker: {name, sector, market_cap, ...}}
         benchmark: benchmark OHLCV DataFrame (aligned with stock data)
         market:    "india" or "us"
+        top_n:     override display cap (trade ranker passes a larger pool size)
 
     Returns:
         DataFrame of top-N RS Leaders sorted by score descending.
     """
-    top_n    = TOP_N_RS_US if market == "us" else TOP_N_RS_INDIA
+    if top_n is None:
+        top_n = TOP_N_RS_US if market == "us" else TOP_N_RS_INDIA
     rows     = []
     total    = len(ohlcv)
     leaders  = 0
@@ -116,6 +120,14 @@ def run_screens_rs(
             if result.rs_score < MIN_RS_SCORE:
                 continue
 
+            # ── Stage 4 gate ──────────────────────────────────────────────
+            # RS line can reach a 52-week high even during a distribution phase
+            # (the stock outperformed on the way DOWN relative to a falling market).
+            # Stage 4 stocks are confirmed downtrends — not the leaders we want
+            # to trade.  Gate them out here so the output stays pure Stage-2 focus.
+            if "Stage 4" in result.stage_label:
+                continue
+
             leaders += 1
 
             row = _result_to_row(
@@ -163,7 +175,9 @@ def run_screens_rs(
         .reset_index(drop=True)
     )
     df_out.insert(0, "Rank", range(1, len(df_out) + 1))
-    return annotate_df(df_out.head(top_n), "rs")
+    result = annotate_df(df_out.head(top_n), "rs")            # First Entry, Days Listed
+    result = annotate_streak_df(result, f"streak_rs_{market}")  # Streak
+    return result
 
 
 # =============================================================================

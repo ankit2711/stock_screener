@@ -190,7 +190,8 @@ def write_results(df: pd.DataFrame, market: str, screener: str = "stage") -> Non
         _write_tab(sheet, tab_label, df, market, col_list)
 
     _prune_old_tabs(sheet)
-    _write_log(sheet, df, market, screener)
+    data_as_of = df.get("data_as_of", "—") if isinstance(df, dict) else "—"
+    _write_log(sheet, df, market, screener, data_as_of=data_as_of)
     logger.info(f"Google Sheets ({market.upper()}/{screener.upper()}) updated")
 
 
@@ -286,6 +287,16 @@ def _write_sector_buckets_tab(
         logger.warning(f"Sector Overview tab write failed: {e}")
 
 
+def _col_letter(n: int) -> str:
+    """Convert 0-based column index to A1-notation letter (A, B, …, Z, AA, AB …)."""
+    result = ""
+    n += 1   # make 1-based
+    while n:
+        n, r = divmod(n - 1, 26)
+        result = chr(65 + r) + result
+    return result
+
+
 def _write_tab(
     sheet,
     tab_name:  str,
@@ -293,7 +304,24 @@ def _write_tab(
     market:    str,
     col_list:  list = None,
 ) -> None:
-    """Create (or overwrite) a date tab with the screener results."""
+    """
+    Create (or overwrite) a worksheet tab with screener results.
+
+    Two-pass write strategy
+    -----------------------
+    Pass 1 — RAW:        writes every cell exactly as-is.
+                         Numbers stay numbers; Google Sheets does NO auto-parsing.
+                         This prevents the "1900-03-18" date misread that happens
+                         when USER_ENTERED sees a small integer in a DATE-formatted cell.
+    Pass 2 — USER_ENTERED: overwrites only the Ticker column (data rows) so that
+                         =HYPERLINK(…) formulas are evaluated into clickable links.
+
+    ws.clear() removes cell *values* but leaves *formats* intact, so a DATE format
+    inherited from a previous Exit-Date column persists.  RAW mode is immune to this:
+    it stores the Python value verbatim without any format-driven reinterpretation.
+    """
+    import math
+
     if col_list is None:
         col_list = OUTPUT_COLUMNS
 
@@ -307,46 +335,69 @@ def _write_tab(
             ws.update(
                 "A1",
                 [[f"No results for {label} — {datetime.now().strftime('%Y-%m-%d %H:%M')}"]],
+                value_input_option="RAW",
             )
             logger.warning(f"{label}: empty results — sheet tab cleared")
             return
 
-        # Build output in column order, only keep columns that exist in df
+        # ── Build output DataFrame ────────────────────────────────────────────
         cols_to_write = [c for c in col_list if c in df.columns]
         out = df[cols_to_write].copy()
 
-        # ── Ticker column → clickable hyperlink pointing to TradingView ─────
-        # The ranker already built the correct TV URL in the TradingView column,
-        # so we reuse it rather than re-derive it from the (already-stripped) ticker.
-        if "Ticker" in out.columns and "TradingView" in df.columns:
-            tv_urls = df["TradingView"].values  # original (before slicing to cols_to_write)
-            out["Ticker"] = [
-                f'=HYPERLINK("{url}", "{ticker}")' if pd.notna(url) and url else ticker
-                for ticker, url in zip(out["Ticker"], tv_urls)
-            ]
-        elif "Ticker" in out.columns:
-            # Fallback: rebuild URL from ticker + market if TradingView col absent
-            out["Ticker"] = out["Ticker"].apply(
-                lambda t: _ticker_hyperlink(str(t), market)
-            )
+        # Coerce float NaN / Inf → "" to prevent JSON serialisation errors.
+        def _safe(v):
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                return ""
+            return v
+        for _c in out.columns:
+            out[_c] = out[_c].apply(_safe)
 
-        # ── TradingView column → "Chart" link text ───────────────────────────
+        # ── Build Ticker hyperlink formulas (stored separately for pass 2) ────
+        ticker_formulas = None   # list of [formula] per data row
+        if "Ticker" in out.columns:
+            ticker_col_idx = cols_to_write.index("Ticker")
+
+            if "TradingView" in df.columns:
+                tv_urls = df["TradingView"].values
+                formulas = [
+                    f'=HYPERLINK("{url}", "{ticker}")' if pd.notna(url) and url else str(ticker)
+                    for ticker, url in zip(out["Ticker"], tv_urls)
+                ]
+            else:
+                formulas = [_ticker_hyperlink(str(t), market) for t in out["Ticker"]]
+
+            ticker_formulas = [[f] for f in formulas]
+
+            # For pass 1 (RAW), write the bare ticker symbol — no formula.
+            # Formulas are added in pass 2 with USER_ENTERED.
+            # Use out["Ticker"] (already contains the clean display symbol).
+            bare = [str(t) for t in out["Ticker"].values]
+            out["Ticker"] = bare
+
+        # ── TradingView column → "Chart" link text (pass 1, no formula) ───────
         if "TradingView" in out.columns:
             out["TradingView"] = out["TradingView"].apply(
                 lambda url: f'=HYPERLINK("{url}", "Chart")' if pd.notna(url) and url else ""
             )
 
-        # Header + data rows
+        # ── Pass 1: write everything with RAW ────────────────────────────────
         header   = [cols_to_write]
         data     = out.values.tolist()
         all_rows = header + data
+        ws.update(all_rows, value_input_option="RAW")
 
-        ws.update(all_rows, value_input_option="USER_ENTERED")
+        # ── Pass 2: overwrite Ticker column with USER_ENTERED formulas ────────
+        if ticker_formulas and "Ticker" in cols_to_write:
+            col_ltr = _col_letter(cols_to_write.index("Ticker"))
+            n_rows  = len(ticker_formulas)
+            ws.update(
+                f"{col_ltr}2:{col_ltr}{n_rows + 1}",
+                ticker_formulas,
+                value_input_option="USER_ENTERED",
+            )
 
-        # Format header row bold
+        # ── Format header row bold + freeze ───────────────────────────────────
         ws.format("1:1", {"textFormat": {"bold": True}})
-
-        # Freeze header row
         sheet.batch_update({
             "requests": [{
                 "updateSheetProperties": {
@@ -396,12 +447,21 @@ def _prune_old_tabs(sheet) -> None:
                 logger.warning(f"Could not prune tab '{ws.title}': {e}")
 
 
-def _write_log(sheet, df: pd.DataFrame, market: str, screener: str = "stage") -> None:
+def _write_log(
+    sheet,
+    df:         pd.DataFrame,
+    market:     str,
+    screener:   str = "stage",
+    data_as_of: str = "—",
+) -> None:
     """Append one row to the Run Log tab (never cleared).
 
     Uses explicit row targeting (column A scan) rather than gspread's
     append_row(), which can misplace entries if the sheet has content
     in non-log columns (e.g. a reference table pasted alongside the log).
+
+    Columns: Timestamp | Market | Screener | Results | Tab | Data As Of | Status
+    "Data As Of" = last trading bar date in the OHLCV feed used for this run.
     """
     try:
         ws  = _get_or_create_worksheet(sheet, SHEET_TABS["log"])
@@ -417,20 +477,30 @@ def _write_log(sheet, df: pd.DataFrame, market: str, screener: str = "stage") ->
 
         # Write header on row 1 if missing or sheet was freshly created
         if last_used == 0:
-            ws.update("A1", [["Timestamp", "Market", "Screener", "Results", "Tab", "Status"]])
+            ws.update("A1", [["Timestamp", "Market", "Screener", "Results", "Tab",
+                               "Data As Of", "Status"]])
             last_used = 1
 
         # Append the new log row immediately after the last used row
         next_row = last_used + 1
-        today = datetime.now().strftime("%Y-%m-%d")
+        today    = datetime.now().strftime("%Y-%m-%d")
+        n_results = 0
+        if isinstance(df, dict):
+            # trade mode: count Trade Candidates rows
+            trade = df.get("trade", pd.DataFrame())
+            n_results = len(trade) if not trade.empty else 0
+        elif hasattr(df, "empty") and not df.empty:
+            n_results = len(df)
+
         ws.update(
             f"A{next_row}",
             [[
                 now,
                 market.upper(),
                 screener.upper(),
-                len(df) if not df.empty else 0,
+                n_results,
                 f"{today}-{screener}",
+                data_as_of,     # which trading day's prices were used
                 "✓ Success",
             ]],
         )

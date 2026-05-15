@@ -49,18 +49,38 @@ INDIA_MIN_MARKET_CAP_INR = 3_000_000_000    # ₹500 Crore minimum
 # BSE-only stocks (.BO suffix) have wider spreads and thinner order books;
 # they require a higher minimum to avoid slippage risk.
 # These are in local currency (INR for India, USD for US).
-MIN_AVG_DOLLAR_VOL_NSE = 10_000_000    # ₹50 lakh/day  — NSE stocks
+MIN_AVG_DOLLAR_VOL_NSE = 10_000_000    # ₹1 crore/day  — NSE stocks
 MIN_AVG_DOLLAR_VOL_BSE = 10_000_000    # ₹1 crore/day  — BSE-only stocks (wider spreads)
 MIN_AVG_DOLLAR_VOL_US  = 10_000_000    # $1M/day        — US stocks
 MIN_AVG_DOLLAR_VOL_AI  =  1_000_000    # $1M/day        — AI theme (curated global list, lower bar)
 
-# Number of top stocks to write to each sheet tab
+# Number of top stocks to write to each sheet tab (display cap)
 TOP_N_US    = 30
 TOP_N_INDIA = 30
 TOP_N_AI    = 100    # AI theme is ~150 stocks — return all that pass Stage 2
 
-# How many calendar days of history to fetch per ticker (1 year = ~252 trading days)
-HISTORY_DAYS = 365
+# Computation pool size — used internally by run_trade_scan to build stage/sepa/rs
+# maps BEFORE truncating to the display cap above.
+#
+# WHY THIS EXISTS:
+#   In a bull market India can have 150-300 genuine Stage-2 stocks.  Capping the
+#   individual screeners at TOP_N_INDIA=30 before building the Trade Candidates
+#   pipeline means a stock ranked #35 in Stage + #8 in RS + #12 in SEPA (a
+#   legitimately high-conviction setup) is invisible.  The pool is larger so Trade
+#   Candidates can see more valid setups; the display cap keeps each tab readable.
+#
+POOL_N_INDIA = 80   # Stage/SEPA/RS internal pool fed into Trade Candidates
+POOL_N_US    = 60
+POOL_N_AI    = 100  # AI is a curated list — no extra pool needed
+
+# How many calendar days of history to fetch per ticker (550 = ~2.2 years / ~390 trading days)
+# WHY 550 NOT 365:
+#   EMA200 needs 200 bars to initialise cleanly.  With 365 calendar days we only get
+#   ~252 trading days — exactly enough, but any gap days, earnings suspensions, or
+#   newly-listed stocks produce a partially-initialised EMA200 that creates false
+#   Stage signals.  550 days gives ~390 trading bars: a 190-bar warm-up buffer for
+#   EMA200 so the first displayed value is always well-converged.
+HISTORY_DAYS = 550
 
 # -----------------------------------------------------------------------------
 # DATA FETCH SETTINGS
@@ -201,216 +221,225 @@ TOP_N_TRADE = 10
 TOP_N_RS_INDIA = 30
 TOP_N_RS_US    = 30
 
-# SEPA output columns (match keys in ranker_sepa._result_to_row)
+# SEPA output columns (match keys in ranker_sepa._result_to_row) — standalone --screener sepa mode
+# Column order: identity → verdict → execution → primary signals → base detail → stage context → meta
 OUTPUT_COLUMNS_SEPA = [
     "Rank",
     "Ticker",
     "Company",
-    # Setup summary
-    "Market Regime",     # Bull (5/5) … Bear (≤1/5) — shown on every row for context
+    # ── Verdict + persistence ─────────────────────────────────────────────────
     "Setup",             # 🟢 Actionable VCP / 🟡 Ready / 🔵 Forming / 🔴 Extended / 🚫 No Base
-    "Path",              # A: Fresh Breakout | B: VCP Base
-    "SEPA Score",
+    "First Entry",       # date this setup first appeared (base age proxy)
+    "Days Listed",       # calendar days since first entry — base maturity indicator
+    # ── Execution ─────────────────────────────────────────────────────────────
     "Breakout State",    # AT_PIVOT | IN_BASE | BREAKOUT | WEAK_BREAKOUT | FADING | EXTENDED
-    "Pivot Dist %",
-    "Stop Dist %",
-    # Path A columns
+    "Pivot Dist %",      # how far from the pivot — the entry timing signal
+    "Stop Dist %",       # (price − stop) / price — position size input
+    # ── Primary conviction signals ────────────────────────────────────────────
+    "RS Leading",        # ✓ RS line at new high before price — primary signal
+    "VCP Count",         # ≥ 2 = proper VCP
+    "Vol Dry %",         # recent vol vs pre-base vol — dry = constructive
+    "Last Tightest",     # tightest recent contraction depth — coiling signal
+    # ── Score & path ─────────────────────────────────────────────────────────
+    "SEPA Score",        # 0–100 composite ranking metric
+    "Path",              # A: Fresh Breakout | B: VCP Base
+    # ── Path A columns ────────────────────────────────────────────────────────
     "Vol Surge",
     "S1 Base CV%",
     "Extension %",
-    # Path B columns
+    # ── Path B base detail ────────────────────────────────────────────────────
     "Base Bars",
     "Base Depth %",
-    "VCP Count",
-    "Last Tightest",
     "ATR Contract",
     "Accum Ratio",
-    "Churn Bars",
-    "Vol Dry %",
     "CV Tight %",
-    "RS Leading",
+    "Churn Bars",
     "Base Count",
     "Base ×Mult",
-    # Stage context
+    # ── Stage & RS context ────────────────────────────────────────────────────
     "Stage",
     "Stage S2",
     "Duration",
-    "RS Status",         # Cheat Entry removed — Entry Signal in Stage tab already captures it
+    "RS Status",
     "RS vs Bench %",
     "Momentum",
     "ROC Fast %",
+    # ── Market regime ─────────────────────────────────────────────────────────
+    "Market Regime",     # Bull (5/5) … Bear (≤1/5) — shown on every row for context
+    # ── Liquidity & risk ──────────────────────────────────────────────────────
     "Avg $ Vol",
+    "Beta",
     "EMA Dist Fast",
     "EMA Dist Mid",
     "EMA Dist Slow",
-    "Beta",              # Beta Label removed — number is sufficient
     "Vol Conv",
     "Market Cap",
     "Sector",
-    "First Reported",
-    "Days Listed",
     # TradingView removed — Ticker is already a clickable hyperlink
     # Last Updated removed — operational noise, no trading value
 ]
 
 # Streamlined Stage columns for the Stage tab written by trade mode
 # (fewer columns than full Stage output — focused on watchlist quality)
+# Column order: identity → action signal → RS quality → momentum → volume → context → tracking
 OUTPUT_COLUMNS_TRADE_STAGE = [
     "Rank",
     "Ticker",           # clickable → TradingView
     "Company",
-    "Exit Date",        # blank while active; date when stock dropped out (kept 14 days)
-    "Exit Reason",      # why it left: e.g. "Stage 2 structure lost" / "EMA21 hold failed"
-    "Score",            # composite Stage-2 score (0–1)
-    "Stage",            # Stage 2 ↑ / Stage 1 / Stage 3 etc.
-    "Stage Score S2",   # raw S2 score out of 10
-    "RS Status",        # RS Strong ↑↑ / RS Strong ↑ / Neutral / Weak
-    "Momentum",         # ↑↑ Strong / ↑ Rising / → Flat / ↓ Weak
+    # ── Action signal + persistence ───────────────────────────────────────────
     "Entry Signal",     # 🟢 Cheat Entry / 🟡 EMA Pullback / 🔵 Near Pivot / ⚪ Extended
+    "Streak",           # consecutive days in Stage Leaders — higher = more institutionally confirmed
+    "First Entry",      # date this stock first appeared in Stage Leaders (never resets)
+    # ── Trend & RS quality ────────────────────────────────────────────────────
+    "Stage",            # Stage 2 ↑ / Stage 1 / Stage 3 etc.
+    "RS Status",        # RS Strong ↑↑ / RS Strong ↑ / Neutral / Weak
+    "RS vs Bench %",    # outperformance vs benchmark — quantifies the RS signal
+    # ── Momentum & volume ─────────────────────────────────────────────────────
+    "Momentum",         # ↑↑ Strong / ↑ Rising / → Flat / ↓ Weak
     "Vol Conviction",   # Very High / High / Normal / Low
     "Avg $ Vol",
     "Sector",
-    "First Reported",
-    "Days Listed",
-    # TradingView removed — Ticker is already a clickable hyperlink
+    # ── Exit tracking (only relevant for exited rows at bottom) ───────────────
+    "Exit Date",        # blank while active; date when stock dropped out (kept 14 days)
+    "Exit Reason",      # why it left: e.g. "Stage 2 structure lost" / "EMA21 hold failed"
 ]
 
 # Streamlined SEPA columns for the SEPA tab written by trade mode
 # (prioritises entry execution over research detail)
+# Column order: identity → verdict → execution prices → pattern quality → weekly context → tracking
 OUTPUT_COLUMNS_TRADE_SEPA = [
     "Rank",
     "Ticker",
     "Company",
-    "Exit Date",        # blank while active; date when stock dropped out (kept 14 days)
-    "Exit Reason",      # why it left: e.g. "Setup invalidated" / "Breakout extended"
-    "SEPA Score",       # primary ranking metric
+    # ── Verdict + persistence ─────────────────────────────────────────────────
     "Setup",            # 🟢/🟡/🔵/🔴 — action verdict at a glance
+    "Streak",           # consecutive days in SEPA Setups — longer = base maturing, entry near
+    "First Entry",      # date this setup first appeared (base age proxy)
+    # ── Execution ─────────────────────────────────────────────────────────────
     "Breakout State",   # AT_PIVOT / BREAKOUT / WEAK_BREAKOUT / IN_BASE
-    "RSI(14)",          # entry timing: 50-65 ideal, >82 extended
     "Entry ₹",          # exact buy price
     "Stop ₹",           # exact stop-loss price
     "Pivot Dist %",     # how far from the pivot (+/-)
     "Stop Dist %",      # (price − stop) / price — your position size input
-    "Vol Signal",       # "dry 0.42×" (pre-breakout) or "surge 2.1×" (breakout)
-    "RS Leading",       # ✓ RS line at new high before price — primary signal
+    # ── Pattern quality ───────────────────────────────────────────────────────
+    "RS Leading",       # ✓ RS line at new high before price — primary conviction signal
     "VCP Count",        # ≥ 2 = proper VCP
+    "Vol Signal",       # "dry 0.42×" (pre-breakout) or "surge 2.1×" (breakout)
+    # ── Weekly structure ──────────────────────────────────────────────────────
     "Weekly Stage",     # W-S2 ✓ is the gold standard
     "TheWrap",          # weekly 10W/20W/40W EMA signal — TW_BULLISH best, TW_FADING reduce
-    # Raw Score removed — debug artifact; SEPA Score is the regime-adjusted final number
+    # ── Score & context ───────────────────────────────────────────────────────
+    "SEPA Score",       # ranking metric — how good the base is
     "Sector",
-    "First Reported",
-    "Days Listed",
-    # TradingView removed — Ticker is already a clickable hyperlink
+    # ── Exit tracking ─────────────────────────────────────────────────────────
+    "Exit Date",        # blank while active; date when stock dropped out (kept 14 days)
+    "Exit Reason",      # why it left: e.g. "Setup invalidated" / "Breakout extended"
+    # RSI(14) removed — entry timing detail; Breakout State + Vol Signal already cover timing
 ]
 
 # RS Leaders output columns (matches ranker_rs._result_to_row)
+# Column order: identity → primary RS signal → relative strength numbers → structure → context → tracking
 OUTPUT_COLUMNS_RS = [
     "Rank",
     "Ticker",
     "Company",
+    # ── Primary RS signal + persistence ──────────────────────────────────────
+    "RS Leads Price",     # 🌟 Leads = RS at new high while price still >5% below its own 52w high
+                          # ✓ Confirms = RS at new high with price also near its high — read this first
+    "Streak",             # consecutive days in RS Leaders — key institutional accumulation signal
+    "First Entry",        # date this stock first achieved RS Leader status
+    # ── RS scoring ────────────────────────────────────────────────────────────
+    "RS Score",           # 0–100 composite RS Leader score
+    "RS at 52w High",     # ✓ if within 3% of 52w RS high (primary filter)
+    "RS % from High",     # % below 52-week RS line high (0 = AT high)
+    # ── Relative strength vs benchmark ───────────────────────────────────────
+    "Resilience",         # Strong Leader / Leader / Neutral / Laggard
+    "Resilience Δ",       # bench_off − stock_off (positive = stock holding up better; the key number)
+    "Stock Off 52w %",    # how far stock price is below its own 52w high
+    # ── Volume & structure ────────────────────────────────────────────────────
+    "Vol Dry",            # ✓ if volume drying up — constructive pre-breakout behaviour
+    "Stage",              # Stage 2 ↑ / Stage 1 Accum / Stage 3 / Stage 4
+    # ── Market context ────────────────────────────────────────────────────────
+    "FTD Signal",         # ✓ FTD if Follow-Through Day detected on benchmark — buy trigger
+    "Market Regime",      # ✅ At High / 🟡 Pullback / 🟠 Correction / 🔴 Deep / 🚨 Bear
+    # ── Liquidity ─────────────────────────────────────────────────────────────
+    "Avg $ Vol",
+    "Sector",
+    # ── Exit tracking ─────────────────────────────────────────────────────────
     "Exit Date",          # blank while active; date when stock dropped out (kept 14 days)
     "Exit Reason",        # why it left: e.g. "RS leadership lost" / "Stage 2 broken"
-    # ── Core RS signal ──────────────────────────────────────────────────────
-    "RS Score",           # 0–100 composite RS Leader score
-    "Resilience",         # Strong Leader / Leader / Neutral / Laggard
-    "RS % from High",     # % below 52-week RS line high (0 = AT high)
-    "RS at 52w High",     # ✓ if within 3% of 52w RS high (primary filter)
-    "RS New High",        # ✓ if RS line at new all-time high in dataset
-    "RS Leads Price",     # 🌟 Leads = RS at new high while price still >5% below its own 52w high
-                          # ✓ Confirms = RS at new high with price also near its high
-                          # · = RS not at new high
-                          # Minervini's highest-conviction pre-breakout signal. Sorted to top.
-    # Score Breakdown removed — debug string (e.g. "RS:35 Res:25 Vol:20…"), not actionable
-    # ── Relative performance ─────────────────────────────────────────────────
-    "Stock Off 52w %",    # how far stock is below its own 52w high
-    "Bench Off 52w %",    # how far benchmark is below 52w high
-    "Resilience Δ",       # bench_off - stock_off (positive = outperforming)
-    "RS vs Bench 1M",     # 1-month RS vs benchmark
-    "RS vs Bench 3M",     # 3-month RS vs benchmark
-    # ── Volume ──────────────────────────────────────────────────────────────
-    "Accum Ratio",        # up-day vol share (>0.55 = accumulating)
-    "Vol Dry",            # ✓ if recent vol drying up (constructive pre-breakout sign)
-    "Vol Dry Ratio",      # 5d avg / 20d avg — exact dryness depth (0.42× vs 0.68× matters)
-    # ── Structure ───────────────────────────────────────────────────────────
-    "Stage",              # Stage 2 ↑ / Stage 1 Accum / Stage 3 / Stage 4
-    # Above EMA200 removed — Stage label already encodes this (Stage 2 = above EMA200)
-    # EMA Stack removed — redundant with Stage + Stage Score
-    "EMA200 Slope",       # 10-day EMA200 slope (positive = turning up — key early signal)
-    "Price vs EMA200",    # % above/below EMA200 (extension risk vs proximity)
-    # ── Base ────────────────────────────────────────────────────────────────
-    "Base Forming",       # ✓ if price range last 20 bars < 10%
-    "Base Depth %",       # % range of last 20 bars (tighter = better)
-    "Consol Bars",        # consecutive bars within 8% of current price
-    # ── Market context ───────────────────────────────────────────────────────
-    "Market Regime",      # ✅ At High / 🟡 Pullback / 🟠 Correction / 🔴 Deep / 🚨 Bear
-    # Bench Off 52w removed — duplicate of Bench Off 52w % in relative performance section
-    "FTD Signal",         # ✓ FTD if Follow-Through Day detected on benchmark
-    # ── Liquidity + meta ─────────────────────────────────────────────────────
-    "Avg $ Vol",
-    "Market Cap",
-    "Sector",
-    "First Reported",
-    "Days Listed",
-    # TradingView removed — Ticker is already a clickable hyperlink
-    # Last Updated removed — operational noise, no trading value
+    # Removed (too granular / redundant):
+    #   RS New High — RS at 52w High already covers this
+    #   Bench Off 52w % — market-wide, same for every row
+    #   RS vs Bench 1M / 3M — RS % from High + Resilience Δ already tell the story
+    #   Accum Ratio / Vol Dry Ratio — Vol Dry boolean is the actionable signal
+    #   EMA200 Slope / Price vs EMA200 — Stage already encodes EMA200 relationship
+    #   Base Forming / Base Depth % / Consol Bars — too granular for this tab
+    #   Market Cap / First Reported / Days Listed — operational meta
 ]
 
 # Trade Candidates output columns (matches ranker_trade._build_output)
-# Left-to-right: act → size → quality scores → conviction → context
+# Column order: identity → tier/action → execution → conviction → scores → context → tracking
 OUTPUT_COLUMNS_TRADE = [
     "Rank",
     "Tier",            # 🟢 Trade Now (active entry) | 👁 Watchlist (wait for FTD)
-    "Reason",          # which screeners confirmed it: Stage2+SEPA+RS / SEPA+RS / Stage2+SEPA / SEPA / RS Leader
-    # ── Execute ────────────────────────────────────────────────────────────────
     "Ticker",          # clickable → TradingView
     "Company",
-    "Exit Date",       # blank while active; date when candidate dropped out (kept 14 days)
-    "Exit Reason",     # why it left: e.g. "RS or Stage criteria lost" / "Breakout extended"
+    # ── Action & persistence ──────────────────────────────────────────────────
     "Action",          # 🟢 BUY NOW / 🔔 BUY STOP / 🟡 CONFIRM VOL / 📋 ALERT
+    "Streak",          # consecutive days as Trade Candidate — longer = setup maturing, higher conviction
+    "First Entry",     # date first appeared as trade candidate (setup age)
+    # ── Execution ─────────────────────────────────────────────────────────────
     "Entry ₹",         # exact price to enter
     "Stop ₹",          # hard stop-loss level
     "Risk %",          # (entry − stop) / entry × 100
     "Pos Size %",      # regime-adjusted position size: (1%/stop%) × regime_factor, cap 8%
-                       # Already accounts for market conditions — this is your actual allocation
-    # ── Quality scores (3 lenses) ──────────────────────────────────────────────
+    # ── Conviction (why this stock?) ──────────────────────────────────────────
+    "Signal Summary",  # RS Leading ✓ | VCP 3 | Weekly S2 ✓ | 1st base ...
+    "Reason",          # which screeners confirmed it: Stage2+SEPA+RS / SEPA+RS / Stage2+SEPA / SEPA
+    # ── Quality scores ────────────────────────────────────────────────────────
     "Trade Score",     # 0–100 unified regime-aware composite
-    "Stage S2",        # Stage-2 quality 0–10 (structural trend)
     "RS Score",        # RS Leader score 0–100 (institutional holding strength)
     "SEPA Score",      # SEPA entry quality (regime-adjusted)
-    "RSI(14)",         # entry timing: 50-65 ideal, >82 extended
-    # ── Conviction signals ─────────────────────────────────────────────────────
-    "Signal Summary",  # RS Leading ✓ | VCP 3 | Weekly S2 ✓ | 1st base ...
-    "Breakout State",  # BREAKOUT | AT_PIVOT | WEAK_BREAKOUT | WATCHLIST
-    # ── Market context ─────────────────────────────────────────────────────────
+    # ── Market & sector context ───────────────────────────────────────────────
     "Regime ⚠",        # ✅ Bull / 🟡 Mild Bull / 🟠 Neutral / 🔴 Caution / 🚨 Bear
     "Sector",
     "Sector Label",    # LEADING ▲ / IMPROVING ↑ / NEUTRAL → / WEAKENING ↓ / LAGGING ✕
-    # Sector × removed — multiplier number is redundant; Sector Label already says LEADING/LAGGING
-    "First Reported",
-    "Days Listed",
-    # TradingView removed — Ticker is already a clickable hyperlink
+    # ── Exit tracking (only relevant for exited rows at bottom) ───────────────
+    "Exit Date",       # blank while active; date when candidate dropped out (kept 14 days)
+    "Exit Reason",     # why it left: e.g. "RS or Stage criteria lost" / "Breakout extended"
+    # Removed:
+    #   Stage S2    — internal debug score; Rank + Reason already encode structure quality
+    #   RSI(14)     — timing detail; Action + Breakout State already summarise it
+    #   Breakout State — Action (🟢 BUY NOW / 🔔 BUY STOP …) already communicates state
 ]
 
 # Holdings Alert — TheWrap-only exit view: ONLY held positions, sorted by urgency.
 # Open this tab first every morning before checking your broker.
+# Column order: identity → urgency → action → signal → distances → levels → context
 OUTPUT_COLUMNS_HOLDINGS_ALERT = [
     "Rank",
     "Ticker",
     "Company",
-    "Portfolio",        # Self / Trading / Niveshaay / International
-    "Gain %",          # % gain vs buy price
-    "Action",          # gain-aware action string with EMA reference levels
+    # ── Priority (read these first, in order) ─────────────────────────────────
     "Urgency",         # 0-100 composite urgency (TheWrap base + slope + gain modifiers)
-    "TheWrap",         # weekly 10W/20W/40W EMA signal label with emoji
-    # Signal Code removed — TheWrap label already encodes the machine code in human form
-    "10W EMA",         # current 10-week EMA price level
-    "20W EMA",         # current 20-week EMA price level
-    "40W EMA",         # current 40-week EMA price level
+    "Action",          # gain-aware action: HOLD / REDUCE / EXIT + EMA reference levels
+    "TheWrap",         # weekly 10W/20W/40W EMA signal — the driving reason for the action
+    "Gain %",          # P&L context: "TW_EXIT with +80% gain" = take profit; "-15%" = stop-loss
+    # ── EMA distance signals (how far are you from each EMA?) ─────────────────
     "vs 10W %",        # price distance from 10W EMA (positive = above)
     "vs 20W %",        # price distance from 20W EMA
     "vs 40W %",        # price distance from 40W EMA
-    "40W Slope",       # 40W EMA velocity label: Rising ↑↑ / Flat → / Falling ↓↓
+    # ── EMA price levels (for limit/stop order placement) ─────────────────────
+    "10W EMA",         # current 10-week EMA price level
+    "20W EMA",         # current 20-week EMA price level
+    "40W EMA",         # current 40-week EMA price level
+    # ── Structure context ─────────────────────────────────────────────────────
+    "40W Slope",       # 40W EMA velocity: Rising ↑↑ / Flat → / Falling ↓↓
     "Weekly Stage",    # Weinstein stage for context
+    "Portfolio",       # Self / Trading / Niveshaay / International
+    # First Entry / Streak removed — holdings appear every day until sold, so streak is
+    # just a trivial counter and first_entry duplicates the buy date already in your broker.
     # TradingView removed — Ticker is already a clickable hyperlink
     # Last Updated removed — operational noise, no trading value
 ]
@@ -418,25 +447,30 @@ OUTPUT_COLUMNS_HOLDINGS_ALERT = [
 # Daily BUY Conviction output columns (matches ranker_conviction.run_conviction_scan)
 # Active stocks shown first (sorted by streak DESC, then conviction DESC).
 # Exited stocks (dropped out in last 30 days) appended at the bottom with "⚪ Exited" action.
+# Column order: identity → action → signals → persistence → price/momentum → tracking
 OUTPUT_COLUMNS_CONVICTION = [
     "Rank",
-    "Ticker",        # clickable hyperlink → TradingView (Ticker IS the link, no separate column needed)
+    "Ticker",        # clickable hyperlink → TradingView
     "Company",
-    "Streak",        # consecutive days in conviction list (persistence = institutional signal)
-    "Days Here",     # total calendar days since first entered the list
-    "First Seen",    # date this stock first entered the conviction list
-    "Left On",       # blank while active; exit date when stock dropped out of list
-    "Exit Reason",   # why it left: "Ranked out of top 20" / "RS + SEPA lost (1/3 remain)"
+    # ── Action + persistence ──────────────────────────────────────────────────
     "Action",        # 🟢 BUY NOW / 🔔 BUY STOP / 📋 SET ALERT / 👁 WATCHLIST / ⚪ Exited
+    "Streak",        # consecutive days in conviction list — the key differentiator
+    "First Seen",    # date this stock first entered the conviction list
+    # ── Signals ───────────────────────────────────────────────────────────────
     "# Signals",     # 2 or 3 — how many of {Stage2, RS, SEPA} are firing
     "Signals",       # "Stage ✓ | RS ✓ | SEPA ✓" — compact signal breakdown
     "RS Signal",     # 🌟 RS Leads Price (pre-breakout) / ✓ RS at 52w High / ·
+    # ── Price & momentum ──────────────────────────────────────────────────────
     "Price ₹",
-    "ROC 5D %",      # 5-day rate of change — tiebreaker when conviction scores cluster; shows recent momentum
+    "ROC 5D %",      # 5-day rate of change — shows recent momentum, breaks ties
     "Sector",
-    # Removed: Conviction (top-20 by score + sorted by it — the column has no display variance)
+    # ── Exit tracking (bottom of tab) ─────────────────────────────────────────
+    "Left On",       # blank while active; exit date when stock dropped out of list
+    "Exit Reason",   # why it left: "Ranked out of top 20" / "RS + SEPA lost (1/3 remain)"
+    # Removed: Conviction score (top-20 by score + sorted by it — no display variance)
     # Removed: Pivot Dist % (always 0 in practice — near-pivot is already the entry condition)
-    # Removed: Weekly Stage (empty for most stocks — sepa_map only covers top-30 SEPA, not full universe)
+    # Removed: Weekly Stage (empty for most stocks — sepa_map only covers SEPA pool, not full universe)
+    # Removed: Days Here (never resets on re-entry — diverges from Streak and misleads)
     # Removed: TradingView (Ticker column is already a clickable hyperlink)
 ]
 
@@ -473,38 +507,46 @@ SHEET_TABS = {
     "sector_overview":  "Sector Overview",    # fixed — sectors grouped by Leading → Lagging buckets
 }
 
-# Columns written to each tab — Stage mode (matches ranker_stage._result_to_row)
+# Columns written to each tab — Stage mode (matches ranker_stage._result_to_row) — standalone --screener stage
+# Column order: identity → action signal → stage quality → RS quality → momentum → volume → risk → meta
 OUTPUT_COLUMNS = [
     "Rank",
     "Ticker",
     "Company",
-    "Score",
+    # ── Action signal + persistence ───────────────────────────────────────────
     "Entry Signal",      # 🟢 Cheat Entry / 🟡 EMA Pullback / 🔵 Near Pivot / ⚪ Extended
-    "Entry Score",
+    "First Entry",       # date this stock first appeared in Stage Leaders (never resets)
+    "Days Listed",       # calendar days since first entry
+    "Entry Score",       # numeric entry timing quality (underlies Entry Signal label)
+    # ── Stage & trend quality ─────────────────────────────────────────────────
     "Stage",
-    "Stage Score S2",
-    "Duration (bars)",
-    # Cheat Entry removed — Entry Signal already shows "🟢 Cheat Entry" when applicable
-    "RS Status",
-    "RS vs Bench %",
-    "Momentum",
-    "ROC Fast %",
-    # Mom Accel removed — redundant with Momentum + ROC Fast % already present
-    "Avg $ Vol",
-    "Vol Trend",
+    "Stage Score S2",    # composite Stage-2 quality score
+    "Duration (bars)",   # bars in current EMA trend — longer = more established
+    # ── Relative strength ─────────────────────────────────────────────────────
+    "RS Status",         # RS Strong ↑↑ / RS Strong ↑ / Neutral / Weak
+    "RS vs Bench %",     # outperformance vs benchmark
+    # ── Momentum ──────────────────────────────────────────────────────────────
+    "Momentum",          # ↑↑ Strong / ↑ Rising / → Flat / ↓ Weak
+    "ROC Fast %",        # fast rate of change — recent price acceleration
+    # ── Volume ────────────────────────────────────────────────────────────────
+    "Vol Conviction",    # Very High / High / Normal / Low
+    "Vol Trend",         # Rising / Flat / Declining — volume trend direction
+    # ── Overall score ─────────────────────────────────────────────────────────
+    "Score",             # composite ranking score
+    # ── Risk & EMA distances ──────────────────────────────────────────────────
     "EMA Dist Fast",
     "EMA Dist Mid",
     "EMA Dist Slow",
     "Beta",
-    # Beta Label removed — derived from Beta number, adds no new information
-    "Vol Conviction",
-    # Vol Ratio removed — Vol Conviction (High/Normal/Low) is the actionable form
-    "PEAD %",
-    # PEAD Label removed — derived from PEAD %, sign is self-evident
+    "PEAD %",            # post-earnings drift — positive = earnings tailwind
+    # ── Liquidity & meta ──────────────────────────────────────────────────────
+    "Avg $ Vol",
     "Market Cap",
     "Sector",
-    "First Reported",
-    "Days Listed",
+    # Mom Accel removed — redundant with Momentum + ROC Fast % already present
+    # Beta Label removed — derived from Beta number, adds no new information
+    # Vol Ratio removed — Vol Conviction (High/Normal/Low) is the actionable form
+    # PEAD Label removed — derived from PEAD %, sign is self-evident
     # TradingView removed — Ticker is already a clickable hyperlink
     # Last Updated removed — operational noise, no trading value
 ]

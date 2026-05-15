@@ -29,6 +29,7 @@ import numpy as np
 from datetime import datetime
 
 from first_seen import annotate_df
+from persistence import annotate_streak_df
 from screeners.stage_analysis import StageAnalysisConfig, run_stage_analysis
 from screeners.sepa import SEPAConfig, SEPAResult, run_sepa_analysis
 from screeners.weekly_stage import (
@@ -79,6 +80,7 @@ def run_screens_sepa(
     market:    str = "india",
     stage_cfg: StageAnalysisConfig = None,
     sepa_cfg:  SEPAConfig = None,
+    top_n:     int = None,          # override default TOP_N; used by trade ranker for larger pool
 ) -> pd.DataFrame:
     """
     Run Stage Analysis + SEPA on every ticker.
@@ -92,13 +94,15 @@ def run_screens_sepa(
         market:    'india' or 'us'
         stage_cfg: StageAnalysisConfig override
         sepa_cfg:  SEPAConfig override
+        top_n:     override display cap (trade ranker passes a larger pool size)
     """
     if stage_cfg is None:
         stage_cfg = _STAGE_CFG
     if sepa_cfg is None:
         sepa_cfg = _SEPA_CFG
 
-    top_n = TOP_N_AI if market == "ai" else TOP_N_US if market == "us" else TOP_N_INDIA
+    if top_n is None:
+        top_n = TOP_N_AI if market == "ai" else TOP_N_US if market == "us" else TOP_N_INDIA
     total = len(ohlcv)
 
     # ── Step 1: Market regime — computed once ─────────────────────────────────
@@ -253,7 +257,9 @@ def run_screens_sepa(
     df_out = pd.DataFrame(rows)
     df_out = df_out.sort_values("SEPA Score", ascending=False).reset_index(drop=True)
     df_out.insert(0, "Rank", range(1, len(df_out) + 1))
-    return annotate_df(df_out.head(top_n), "sepa")
+    result = annotate_df(df_out.head(top_n), "sepa")              # First Entry, Days Listed
+    result = annotate_streak_df(result, f"streak_sepa_{market}")  # Streak
+    return result
 
 
 # =============================================================================
