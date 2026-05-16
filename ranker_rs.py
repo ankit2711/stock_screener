@@ -193,6 +193,7 @@ def _result_to_row(
     bench_label: str,
 ) -> dict:
     ticker_display = raw_ticker.replace(".NS", "").replace(".BO", "")
+    is_india = ".NS" in raw_ticker or ".BO" in raw_ticker
 
     if ".NS" in raw_ticker:
         tv_symbol = f"NSE:{ticker_display}"
@@ -262,8 +263,8 @@ def _result_to_row(
         "Market Regime":    bench_label,
         "Bench Off 52w":    f"-{bench_off:.1f}%",
         "FTD Signal":       "✓ FTD" if result.ftd_detected else "·",
-        "Avg $ Vol":        _fmt_dollar_vol(result.avg_dollar_vol),
-        "Market Cap":       _fmt_mcap(result.market_cap),
+        "Avg $ Vol":        _fmt_dollar_vol(result.avg_dollar_vol, is_india=is_india),
+        "Market Cap":       _fmt_mcap(result.market_cap, is_india=is_india),
         "Sector":           meta.get("sector", "Unknown"),
         "TradingView":      tv_url,
         "Last Updated":     datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -288,16 +289,26 @@ def _bench_regime_label(pct_off: float) -> str:
         return f"🚨 -{pct_off:.0f}% (Bear Market)"
 
 
-def _fmt_dollar_vol(adv: float) -> str:
+def _fmt_dollar_vol(adv: float, is_india: bool = False) -> str:
+    # BUG FIX: was checking $B (1e9) before ₹Cr (1e7) — Indian stocks ≥₹100Cr
+    # (= 1e9 rupees) showed "$1.00B" instead of "₹100.00Cr".
+    # Fix: when is_india=True use INR path exclusively; USD path otherwise.
+    if is_india:
+        if adv >= 1e9:   return f"₹{adv / 1e7:.0f}Cr"
+        if adv >= 1e7:   return f"₹{adv / 1e7:.2f}Cr"
+        return f"₹{adv:,.0f}"
     if adv >= 1e9:   return f"${adv / 1e9:.2f}B"
-    if adv >= 1e7:   return f"₹{adv / 1e7:.2f}Cr"   # Indian crore — must precede $M check
     if adv >= 1e6:   return f"${adv / 1e6:.2f}M"
     return f"${adv:,.0f}"
 
 
-def _fmt_mcap(cap: float) -> str:
+def _fmt_mcap(cap: float, is_india: bool = False) -> str:
     if not cap:      return "N/A"
+    # BUG FIX: same issue — Indian stocks ≥₹100Cr (1e9 rupees) showed "$X.XB".
+    if is_india:
+        if cap >= 1e12:  return f"₹{cap / 1e7:.0f}Cr"   # ₹1,000Cr+ → show in Cr
+        if cap >= 1e7:   return f"₹{cap / 1e7:.0f}Cr"
+        return f"₹{cap:,.0f}"
     if cap >= 1e12:  return f"${cap / 1e12:.1f}T"
     if cap >= 1e9:   return f"${cap / 1e9:.1f}B"
-    if cap >= 1e7:   return f"₹{cap / 1e7:.0f}Cr"
     return f"${cap:,.0f}"

@@ -245,7 +245,7 @@ def run_trade_scan(
     all_tier_ab_tickers = {r["_ticker"] for r in tier_a} | {r["_ticker"] for r in tier_b}
     tier_b_stage = _build_tier_b_stage(
         stage_pool, exclude=all_tier_ab_tickers,
-        weights=weights, regime_label=regime_label, regime_mult=regime_mult,
+        weights=weights, ohlcv=ohlcv, regime_label=regime_label, regime_mult=regime_mult,
         sector_results=sector_results, metadata=metadata, market=market,
     )
     tier_b.extend(tier_b_stage)
@@ -344,6 +344,14 @@ def run_trade_scan(
 
     logger.info(f"TRADE SCAN: Regime slot allocation → {regime_slots_label}")
 
+    # Build full pre-cap pool for reentry_pool — stocks that scored high enough to
+    # qualify as Tier A/B candidates but fell outside the regime slot cap should NOT
+    # be immediately exit-stamped. Without this, a stock at rank 13 (cap=12) would
+    # appear in the exit section the very next day even though it still passes all gates.
+    trade_full_pool_df = pd.DataFrame(
+        [{"Ticker": c["_ticker"]} for c in tier_a + tier_b]
+    ) if (tier_a or tier_b) else pd.DataFrame(columns=["Ticker"])
+
     all_candidates = (
         sorted(tier_a, key=lambda r: r["_score"], reverse=True)[:n_tier_a] +
         sorted(tier_b, key=lambda r: r["_score"], reverse=True)[:n_tier_b]
@@ -426,6 +434,7 @@ def run_trade_scan(
             exit_reason=lambda t, row: _trade_exit_reason(
                 t, row, ohlcv, _active_stage, _active_sepa, _active_rs
             ),
+            reentry_pool=trade_full_pool_df,   # prevent false-exit for regime-slot-capped stocks
             data_as_of=data_as_of,
         )
     except Exception as _ee:
@@ -1150,7 +1159,8 @@ def _build_tier_b_stage(
     stage_df:       pd.DataFrame,
     exclude:        set,
     weights:        dict,
-    regime_label:   str,
+    ohlcv:          dict  = None,
+    regime_label:   str   = "Unknown",
     regime_mult:    float = 1.0,
     sector_results: dict  = None,
     metadata:       dict  = None,
@@ -1213,13 +1223,39 @@ def _build_tier_b_stage(
         if weekly_stage_str in ("W-S1 Accum", "W-S4 Decline"):
             continue
 
+        # OHLCV — needed for real price, RSI, and stop computation
+        raw_df_s = (
+            ohlcv.get(_restore_ticker(ticker, ohlcv), pd.DataFrame())
+            if ohlcv else pd.DataFrame()
+        )
+        price_s  = float(raw_df_s["close"].iloc[-1]) if not raw_df_s.empty else 0.0
+        rsi_s    = _quick_rsi(raw_df_s)
+        pivot_s  = _estimate_pivot(raw_df_s, price_s)
+        if not raw_df_s.empty and len(raw_df_s) >= 21:
+            ema21_s = float(raw_df_s["close"].ewm(span=21, adjust=False).mean().iloc[-1])
+        else:
+            ema21_s = price_s * 0.97   # fallback: 3% below price
+        stop_s      = round(ema21_s * 0.97, 2)   # 3% below EMA21 — structural stop
+        stop_dist_s = max(0.5, (price_s - stop_s) / price_s * 100) if price_s > 0 and stop_s > 0 else 7.0
+
         # Score: stage quality + momentum + volume (no SEPA/RS Leader component)
+        # BUG FIX: was hardcoded 0.60/0.25/0.15 — now uses regime-aware weights so
+        # a bear-market scan (high RS weight) naturally increases the momentum weight
+        # (RS proxy) relative to stage structure.
         s2_pts     = float(row.get("Stage Score S2", 0))
         stage_norm = min(s2_pts / 10.0, 1.0)
         mom_norm   = 1.0 if "↑↑" in momentum  else 0.6
         vol_norm   = 1.0 if "Very High" in vol_conv else (0.7 if "High" in vol_conv else 0.4)
 
-        score = (stage_norm * 0.60 + mom_norm * 0.25 + vol_norm * 0.15) * 60.0
+        # Redistribute the 5-component weight dict into a 3-component model:
+        #   structural quality → stage + state weights
+        #   momentum           → sepa + rs weights (momentum proxies for entry quality)
+        #   volume             → stop weight
+        w_stage = weights.get("stage", 0.25) + weights.get("state", 0.15)
+        w_mom   = weights.get("sepa",  0.35) + weights.get("rs",    0.15)
+        w_vol   = weights.get("stop",  0.10)
+        total_w = w_stage + w_mom + w_vol
+        score   = (stage_norm * w_stage/total_w + mom_norm * w_mom/total_w + vol_norm * w_vol/total_w) * 60.0
         if rs_status == "Strong ↑":
             score += 5.0    # "Strong ↑" (strong + rising) gets a small boost over "Moderate ↑"
 
@@ -1240,13 +1276,13 @@ def _build_tier_b_stage(
             "_sepa_raw":     0.0,
             "_s2_pts":       round(s2_pts, 1),
             "_rs_pts":       0.0,
-            "_rsi":          50.0,
-            "_stop_dist":    0.0,
+            "_rsi":          round(rsi_s, 0),
+            "_stop_dist":    round(stop_dist_s, 1),
             "_pivot_dist":   0.0,
             "_regime":       regime_label,
-            "_price":        0.0,
-            "_entry":        0.0,
-            "_stop":         0.0,
+            "_price":        round(price_s, 2),
+            "_entry":        round(pivot_s, 2),
+            "_stop":         round(stop_s,  2),
             "_company":      str(row.get("Company", ticker)),
             "_sector":       str(row.get("Sector",  "Unknown")),
             "_tv":           str(row.get("TradingView", "")),

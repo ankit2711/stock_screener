@@ -396,13 +396,20 @@ def run_sepa_analysis(
     # ── Capture raw score BEFORE regime multiplier ────────────────────────────
     # Used by trade ranker to rank stocks on their own merits independently
     # of current market conditions (regime is shown as a separate warning).
+    # Cap at 100 before capturing raw_sepa_score — path bonuses (pocket pivot +15,
+    # cheat entry +8, RSI boost *1.05) can push the score beyond the documented
+    # 0-100 range. Capping here keeps the displayed "Raw Score" column honest.
+    r.sepa_score     = min(r.sepa_score, 100.0)
     r.raw_sepa_score = round(r.sepa_score * r.base_count_mult, 1)
 
     # ── External multipliers ──────────────────────────────────────────────────
     r.sepa_score = round(r.sepa_score * r.base_count_mult * regime_mult, 1)
     r.score      = r.sepa_score
 
-    r.passed = (r.stage >= 2) or stage_result.is_cheat_entry
+    # BUG FIX: was (r.stage >= 2) which passes Stage 3 AND Stage 4 stocks.
+    # Only Stage 2 (advancing) or a Cheat Entry (EMA21 pullback on a proven S2 leader)
+    # should be marked passed. Stage 3 (distributing) and Stage 4 (declining) must fail.
+    r.passed = (r.stage == 2) or stage_result.is_cheat_entry
     return r
 
 
@@ -1689,7 +1696,11 @@ def _rsi_sepa_modifier(rsi: float, state: str) -> float:
       Momentum must be confirmed. Ideal 50-65. Penalize extension (>82) and
       absent momentum (<40) meaningfully.
     """
-    if state in ("AT_PIVOT", "IN_BASE"):
+    # BUG FIX: "EARLY" (> 15% below base high, too early) is a pre-breakout state
+    # like AT_PIVOT and IN_BASE — stock is consolidating, not breaking out. It was
+    # falling through to the breakout branch below, getting the stricter breakout
+    # RSI penalties (0.80 for RSI<40) instead of the lenient consolidation logic.
+    if state in ("AT_PIVOT", "IN_BASE", "EARLY"):
         if rsi > 80:  return 0.88   # already extended before the break — caution
         if rsi < 30:  return 0.75   # structural breakdown, not consolidation
         return 1.00                  # normal consolidation range — no adjustment

@@ -39,7 +39,10 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-_CACHE_FILE = Path("cache/first_seen.json")
+# BUG FIX: was Path("cache/first_seen.json") — relative path resolves from CWD.
+# Running from any directory other than the project root silently loses all first-seen
+# history. Anchor to module directory so the path is always correct regardless of CWD.
+_CACHE_FILE = Path(__file__).parent / "cache" / "first_seen.json"
 
 
 # =============================================================================

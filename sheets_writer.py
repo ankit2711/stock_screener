@@ -144,28 +144,33 @@ def write_results(df: pd.DataFrame, market: str, screener: str = "stage") -> Non
             trade_df  = df
             sector_res = {}
 
-        # Stage / SEPA / RS: fixed tabs only — overwritten each run, always current.
-        _write_tab(sheet, SHEET_TABS["stage_trade"], stage_df, market, OUTPUT_COLUMNS_TRADE_STAGE)
-        _write_tab(sheet, SHEET_TABS["sepa_trade"],  sepa_df,  market, OUTPUT_COLUMNS_TRADE_SEPA)
-        _write_tab(sheet, SHEET_TABS["rs_trade"],    rs_df,    market, OUTPUT_COLUMNS_RS)
+        # BUG FIX: previously each _write_tab call propagated its exception upward,
+        # aborting all remaining tabs and the run log. One bad tab silently killed
+        # the entire write. Now each tab is wrapped independently — a failure in
+        # Stage Leaders does not prevent Trade Candidates from being written.
+        def _safe_write(tab_key_or_name, df_arg, col_arg, label_for_log=""):
+            name = SHEET_TABS.get(tab_key_or_name, tab_key_or_name)
+            try:
+                _write_tab(sheet, name, df_arg, market, col_arg)
+            except Exception as _tw_err:
+                logger.error(f"Tab '{name}' write failed ({label_for_log or name}): {_tw_err}")
 
-        # Trade Candidates: fixed tab only — exited stocks stay at the bottom for 14 days,
-        # so there is no need for a separate dated archive tab.
-        _write_tab(sheet, SHEET_TABS["trade"], trade_df, market, OUTPUT_COLUMNS_TRADE)
+        # Stage / SEPA / RS: fixed tabs only — overwritten each run, always current.
+        _safe_write("stage_trade", stage_df,    OUTPUT_COLUMNS_TRADE_STAGE, "Stage Leaders")
+        _safe_write("sepa_trade",  sepa_df,     OUTPUT_COLUMNS_TRADE_SEPA,  "SEPA Setups")
+        _safe_write("rs_trade",    rs_df,       OUTPUT_COLUMNS_RS,          "RS Leaders")
+
+        # Trade Candidates: fixed tab only — exited stocks stay at the bottom for 14 days.
+        _safe_write("trade",       trade_df,    OUTPUT_COLUMNS_TRADE,       "Trade Candidates")
 
         # Daily BUY Conviction: stocks confirmed by 2+ screeners simultaneously.
-        # Sorted by Streak DESC → consecutive days = institutional persistence signal.
-        # This is the primary daily BUY watchlist tab — open this first every morning.
-        _write_tab(sheet, SHEET_TABS["conviction"], conviction_df, market, OUTPUT_COLUMNS_CONVICTION)
+        _safe_write("conviction",  conviction_df, OUTPUT_COLUMNS_CONVICTION, "Daily BUY Conviction")
 
         # Data Issues: tickers with NaN price/volume, stale feeds, or price spikes.
-        # Shows exactly which stocks the screeners are silently skipping and why.
-        _write_tab(sheet, SHEET_TABS["data_quality"], data_quality_df, market, OUTPUT_COLUMNS_DATA_QUALITY)
+        _safe_write("data_quality", data_quality_df, OUTPUT_COLUMNS_DATA_QUALITY, "Data Issues")
 
         # Holdings Alert: ONLY held positions sorted by TheWrap urgency.
-        # Open this tab first every morning before checking your broker.
-        _write_tab(sheet, SHEET_TABS["holdings_alert"], holdings_alert_df, market,
-                   OUTPUT_COLUMNS_HOLDINGS_ALERT)
+        _safe_write("holdings_alert", holdings_alert_df, OUTPUT_COLUMNS_HOLDINGS_ALERT, "Holdings Alert")
 
         # Sector Rotation: fixed tab — flat ranked list.
         # Always written (even if sector scan returned nothing) so the tab exists.
@@ -177,18 +182,26 @@ def write_results(df: pd.DataFrame, market: str, screener: str = "stage") -> Non
             logger.warning(f"Sector Rotation tab write failed: {_se}")
 
         # Sector Overview: fixed tab — sectors grouped into Leading → Lagging buckets.
-        # Always written so the tab exists even when sector data is unavailable.
-        _write_sector_buckets_tab(sheet, SHEET_TABS["sector_overview"], sector_res, market)
+        try:
+            _write_sector_buckets_tab(sheet, SHEET_TABS["sector_overview"], sector_res, market)
+        except Exception as _se2:
+            logger.warning(f"Sector Overview tab write failed: {_se2}")
 
     elif screener == "rs":
-        # Standalone RS scan — fixed tab only (consistent with above)
-        _write_tab(sheet, SHEET_TABS["rs_trade"], df, market, OUTPUT_COLUMNS_RS)
+        try:
+            _write_tab(sheet, SHEET_TABS["rs_trade"], df, market, OUTPUT_COLUMNS_RS)
+        except Exception as _rse:
+            logger.error(f"RS Leaders tab write failed: {_rse}")
 
     else:
         tab_label = f"{today}-{screener}"
         col_list  = OUTPUT_COLUMNS_SEPA if screener == "sepa" else OUTPUT_COLUMNS
-        _write_tab(sheet, tab_label, df, market, col_list)
+        try:
+            _write_tab(sheet, tab_label, df, market, col_list)
+        except Exception as _ste:
+            logger.error(f"Tab '{tab_label}' write failed: {_ste}")
 
+    # Run log always written — even if one or more tabs failed above.
     _prune_old_tabs(sheet)
     data_as_of = df.get("data_as_of", "—") if isinstance(df, dict) else "—"
     _write_log(sheet, df, market, screener, data_as_of=data_as_of)
@@ -360,7 +373,10 @@ def _write_tab(
             if "TradingView" in df.columns:
                 tv_urls = df["TradingView"].values
                 formulas = [
-                    f'=HYPERLINK("{url}", "{ticker}")' if pd.notna(url) and url else str(ticker)
+                    # BUG FIX: separator rows ("─── Exited…") must never get a HYPERLINK
+                    # formula — =HYPERLINK("—", "─── Exited…") is invalid and shows #ERROR.
+                    str(ticker) if str(ticker).startswith("─") else
+                    (f'=HYPERLINK("{url}", "{ticker}")' if pd.notna(url) and url else str(ticker))
                     for ticker, url in zip(out["Ticker"], tv_urls)
                 ]
             else:
@@ -381,10 +397,13 @@ def _write_tab(
             )
 
         # ── Pass 1: write everything with RAW ────────────────────────────────
+        # BUG FIX: gspread ≥ 6.x changed Worksheet.update() signature — the first
+        # positional argument must be a range string, not a list. Passing a list
+        # as the first arg worked in gspread 5.x but raises TypeError in 6.x.
         header   = [cols_to_write]
         data     = out.values.tolist()
         all_rows = header + data
-        ws.update(all_rows, value_input_option="RAW")
+        ws.update("A1", all_rows, value_input_option="RAW")
 
         # ── Pass 2: overwrite Ticker column with USER_ENTERED formulas ────────
         if ticker_formulas and "Ticker" in cols_to_write:
@@ -414,7 +433,7 @@ def _write_tab(
 
     except Exception as e:
         logger.error(f"Failed to write {market} tab '{tab_name}': {e}")
-        raise
+        raise   # caller (_safe_write / individual try blocks) catches and continues
 
 
 def _prune_old_tabs(sheet) -> None:

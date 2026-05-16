@@ -257,6 +257,11 @@ def run_conviction_scan(
                 "Exit Reason":  reason_str,
             })
 
+    # BUG FIX: insert Rank BEFORE appending exited/separator rows so only
+    # active stocks get sequential rank numbers.  Exited rows and the separator
+    # get "—" to make it visually clear they are historical, not ranked.
+    df_out.insert(0, "Rank", range(1, len(df_out) + 1))
+
     if exited_rows:
         df_exited = pd.DataFrame(exited_rows)
         # Sort exited by exit_date DESC so most recent exits appear first
@@ -265,11 +270,16 @@ def run_conviction_scan(
         # Visual separator between the live conviction list and the exited section
         sep = {col: "" for col in df_out.columns}
         sep["Ticker"] = "─── Exited — last 30 days ───"
+        sep["Rank"]   = "—"
         df_sep = pd.DataFrame([sep])
 
-        df_out = pd.concat([df_out, df_sep, df_exited], ignore_index=True)
+        # Exited rows get "—" rank, not a sequential number
+        if "Rank" not in df_exited.columns:
+            df_exited.insert(0, "Rank", "—")
+        else:
+            df_exited["Rank"] = "—"
 
-    df_out.insert(0, "Rank", range(1, len(df_out) + 1))
+        df_out = pd.concat([df_out, df_sep, df_exited], ignore_index=True)
 
     # Replace any remaining NaN with "" so JSON serialisation (gspread) never fails.
     # NaN can appear in columns that exist on active rows but are absent from

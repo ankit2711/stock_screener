@@ -43,6 +43,7 @@
 # =============================================================================
 
 import pandas as pd
+from datetime import date as _date
 
 
 # ── Public label map — used wherever an int stage needs to become a string ───
@@ -136,7 +137,9 @@ def get_weekly_stage_weinstein(weekly_df: pd.DataFrame) -> tuple:
         return 0, "Unknown", 0.0, False, False
 
     # ── Slope: 4-week comparison (≈ 1 calendar month) ────────────────────────
-    ma_4w      = float(sma30.iloc[-4]) if len(sma30) >= 4 and not pd.isna(sma30.iloc[-4]) else ma_now
+    # BUG FIX: iloc[-4] gives the bar 3 weeks ago (0-indexed), producing a
+    # 3-period gap not a 4-period one.  Use iloc[-5] for a true 4-bar gap.
+    ma_4w      = float(sma30.iloc[-5]) if len(sma30) >= 5 and not pd.isna(sma30.iloc[-5]) else ma_now
     ma_rising  = ma_now > ma_4w * 1.001   # must lift ≥ 0.1% to count as rising
     ma_falling = ma_now < ma_4w * 0.999
 
@@ -155,9 +158,14 @@ def get_weekly_stage_weinstein(weekly_df: pd.DataFrame) -> tuple:
     # ── Breakout volume confirmation ──────────────────────────────────────────
     # Latest weekly bar should be the heaviest volume week in 13 weeks.
     # ≥90% of the 13-week max is the threshold (allows for minor shortfall).
-    if len(vol_w) >= 13:
+    # BUG FIX: was vol_w.iloc[-13:].max() which includes the current bar (iloc[-1])
+    # in the max. Since vol_this IS in the window, vol_this >= vol_13w_max * 0.90
+    # was trivially True whenever the current week IS the 13-week max volume week.
+    # This made breakout_vol fire constantly, reducing its signal quality to zero.
+    # Fix: exclude the current bar from the max comparison (iloc[-13:-1]).
+    if len(vol_w) >= 14:   # need 14 bars so -13:-1 gives 12 prior bars minimum
         vol_this    = float(vol_w.iloc[-1])
-        vol_13w_max = float(vol_w.iloc[-13:].max())
+        vol_13w_max = float(vol_w.iloc[-13:-1].max())   # prior 12 bars, not including current
         breakout_vol = vol_this >= vol_13w_max * 0.90
     else:
         breakout_vol = False
@@ -243,9 +251,16 @@ def compute_thewrap_signal(weekly_df: pd.DataFrame) -> tuple:
         return "TW_NONE", THEWRAP_LABELS["TW_NONE"], 0.0, 0.0, 0.0
 
     # ── Exclude incomplete current week (partial bar distorts EMAs) ───────────
+    # BUG FIX: resample("W-FRI") always anchors bar index to Friday, so
+    # wdf.index[-1].weekday() is ALWAYS 4 (Friday) — the check never fired.
+    # Mid-week data was always included, distorting EMA signals.
+    # Fix: compare the bar's Friday anchor date against today's real date.
+    # If today is before that Friday, the current week is incomplete → strip it.
     wdf = weekly_df.copy()
-    if len(wdf) >= 2 and wdf.index[-1].weekday() != 4:  # 4 = Friday
-        wdf = wdf.iloc[:-1]
+    if len(wdf) >= 2:
+        last_bar_date = wdf.index[-1].date() if hasattr(wdf.index[-1], "date") else _date.today()
+        if last_bar_date > _date.today():   # anchor date is in the future → partial week
+            wdf = wdf.iloc[:-1]
 
     if len(wdf) < 42:
         return "TW_NONE", THEWRAP_LABELS["TW_NONE"], 0.0, 0.0, 0.0

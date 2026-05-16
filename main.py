@@ -392,16 +392,28 @@ def run(market: str = "india", screener: str = "stage"):
         success = True
 
         if market in ("india", "both"):
-            ok = run_india(screener)
-            success = success and ok
+            try:
+                ok = run_india(screener)
+                success = success and ok
+            except Exception as _india_err:
+                logger.exception(f"India run failed (continuing): {_india_err}")
+                success = False
 
         if market in ("us", "both"):
-            ok = run_us(screener)
-            success = success and ok
+            try:
+                ok = run_us(screener)
+                success = success and ok
+            except Exception as _us_err:
+                logger.exception(f"US run failed (continuing): {_us_err}")
+                success = False
 
         if market == "ai":
-            ok = run_ai(screener)
-            success = success and ok
+            try:
+                ok = run_ai(screener)
+                success = success and ok
+            except Exception as _ai_err:
+                logger.exception(f"AI run failed (continuing): {_ai_err}")
+                success = False
 
         elapsed = (datetime.now() - start).seconds
         status  = "✓ Completed" if success else "⚠ Completed with errors"

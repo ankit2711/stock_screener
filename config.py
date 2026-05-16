@@ -41,8 +41,8 @@ MAX_HISTORY_TABS = 30
 # -----------------------------------------------------------------------------
 # MARKET UNIVERSE & FILTERS
 # -----------------------------------------------------------------------------
-US_MIN_MARKET_CAP_USD = 20_000_000_000       # $10B minimum
-INDIA_MIN_MARKET_CAP_INR = 3_000_000_000    # ₹500 Crore minimum
+US_MIN_MARKET_CAP_USD = 20_000_000_000       # $20B minimum
+INDIA_MIN_MARKET_CAP_INR = 3_000_000_000    # ₹300 Crore minimum
 
 # Minimum average daily dollar volume — exchange-aware liquidity filter
 # Applied in ranker_stage, ranker_sepa, ranker_rs to remove untradeable stocks.

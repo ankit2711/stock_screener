@@ -210,7 +210,13 @@ def run_rs_leaders_analysis(
         result.resilience_label = "Laggard"
 
     # ── Volume accumulation ───────────────────────────────────────────────────
-    vol = volume.reindex(common).fillna(0)
+    # BUG FIX: was fillna(0) — non-trading days in the common index (e.g. Indian
+    # stock on a day the NSE was open but yfinance data is missing) got vol=0,
+    # which artificially suppressed the 20-day average and caused valid liquid stocks
+    # to fail the MIN_AVG_DOLLAR_VOL liquidity filter. Use dropna() so only real
+    # trading days contribute to the average.
+    vol = volume.reindex(common).fillna(0)   # fillna(0) kept for accum ratio (up/down day needs 0 not NaN)
+    vol_clean = volume.reindex(common).dropna()  # use only real trading days for dollar vol
     recent_vol = vol.iloc[-20:]
     price_changes = s_close.iloc[-20:].pct_change().fillna(0)
 
@@ -225,7 +231,7 @@ def run_rs_leaders_analysis(
     result.accum_ratio  = round(accum, 3)
     result.vol_dry      = dry_ratio < 0.70
     result.vol_dry_ratio = round(dry_ratio, 3)
-    result.avg_dollar_vol = round(float(vol.iloc[-20:].mean()) * price, 0)
+    result.avg_dollar_vol = round(float(vol_clean.iloc[-20:].mean()) * price, 0) if len(vol_clean) >= 5 else 0.0
 
     # ── Structural integrity ──────────────────────────────────────────────────
     ema10  = float(close.ewm(span=10,  adjust=False).mean().iloc[-1])
@@ -404,7 +410,10 @@ def _quick_stage(price: float, ema50: float, ema200: float, ema200_slope: float)
     elif above_200 and above_50:
         return 2, "Stage 2 (flat)"
     elif above_200 and not above_50:
-        return 1, "Stage 1 Accum"
+        # BUG FIX: price above EMA200 but below EMA50 = topping / early distribution
+        # (EMA50 rolling over while price still floats above EMA200).
+        # Was incorrectly labelled "Stage 1 Accum" — Stage 1 requires price BELOW EMA200.
+        return 3, "Stage 3 Dist"
     elif not above_200 and not above_50 and not ma_rising:
         return 4, "Stage 4 ↓"
     else:

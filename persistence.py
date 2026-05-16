@@ -39,7 +39,11 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-_CACHE_FILE = Path("cache/persistence.json")
+# BUG FIX: was Path("cache/persistence.json") — a relative path that resolves to
+# whatever the shell's CWD is at launch. If the process is started from any directory
+# other than the project root, a new empty cache is silently created, losing all
+# streak/exit history. Fix: anchor to the module's own directory via __file__.
+_CACHE_FILE = Path(__file__).parent / "cache" / "persistence.json"
 
 
 def get_data_as_of(benchmark) -> str:
@@ -549,7 +553,7 @@ def append_screener_exits(
 
     # ── Visual separator between live section and exited section ──────────────
     separator = {col: "" for col in df.columns}
-    separator[key_col] = "─── Exited — last 14 days ───"
+    separator[key_col] = f"─── Exited — last {days} days ───"
 
     df_sep    = pd.DataFrame([separator], columns=df.columns)
     df_exited = pd.DataFrame(exited_rows, columns=df.columns)
