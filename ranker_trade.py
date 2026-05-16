@@ -90,13 +90,10 @@ _REGIME_WEIGHTS = {
     "bear":      {"sepa": 0.12, "stage": 0.15, "rs": 0.48, "state": 0.15, "stop": 0.10},
 }
 
-# Hard gate thresholds — any failure eliminates Tier A candidates
-_GATE = {
-    "allowed_states":     {"BREAKOUT", "AT_PIVOT", "WEAK_BREAKOUT", "IN_BASE"},
-    "max_pivot_dist_pct":  5.0,
-    "min_pivot_dist_pct": -8.0,   # IN_BASE stocks >8% below pivot → Tier B only
-    "max_stop_dist_pct":  11.0,   # raised from 9% — valid VCP bases can have wider stops
-}
+# _REGIME_WEIGHTS kept as reference documentation for the market regime framework.
+# They are NO LONGER used for scoring (regime only affects the warning label shown
+# to the user — position sizing is manual).  Do not delete — they document the
+# intended weighting rationale for each market condition.
 
 
 # =============================================================================
@@ -196,7 +193,7 @@ def run_trade_scan(
     sepa_map  = _df_to_map(sepa_pool,  "Ticker")
     rs_map    = _df_to_map(rs_pool,    "Ticker")
 
-    # ── Step 3: Combined candidate pool — union of all three screener pools ──
+    # ── Step 4: Combined candidate pool — union of all three screener pools ──
     all_tickers = (
         {str(r.get("Ticker", "")) for _, r in stage_pool.iterrows()} |
         {str(r.get("Ticker", "")) for _, r in sepa_pool.iterrows()}  |
@@ -204,26 +201,31 @@ def run_trade_scan(
     ) - {"", "nan"}
     logger.info(f"TRADE SCAN: Combined pool = {len(all_tickers)} unique tickers to score")
 
-    # ── Step 4: Score every candidate through the unified function ────────────
+    # ── Step 5: Score every candidate through the unified function ────────────
+    # Each ticker is wrapped in try/except — a single bad ticker (missing column,
+    # zero-division, bad cast) must never abort the entire trade scan.
     candidates: list[dict] = []
     for ticker in all_tickers:
-        result = _score_candidate(
-            ticker         = ticker,
-            stage_row      = stage_map.get(ticker, {}),
-            sepa_row       = sepa_map.get(ticker, {}),
-            rs_row         = rs_map.get(ticker,   {}),
-            ohlcv          = ohlcv,
-            regime_label   = regime_label,
-            sector_results = sector_results,
-            metadata       = metadata,
-            market         = market,
-        )
-        if result is not None:
-            candidates.append(result)
+        try:
+            result = _score_candidate(
+                ticker         = ticker,
+                stage_row      = stage_map.get(ticker, {}),
+                sepa_row       = sepa_map.get(ticker, {}),
+                rs_row         = rs_map.get(ticker,   {}),
+                ohlcv          = ohlcv,
+                regime_label   = regime_label,
+                sector_results = sector_results,
+                metadata       = metadata,
+                market         = market,
+            )
+            if result is not None:
+                candidates.append(result)
+        except Exception as _score_err:
+            logger.debug(f"_score_candidate failed for {ticker}: {_score_err}")
 
     logger.info(f"TRADE SCAN: Unified scoring → {len(candidates)} candidates above quality floor (score ≥ 40)")
 
-    # ── Step 5: Conviction streak score boost ────────────────────────────────
+    # ── Step 6: Conviction streak score boost ────────────────────────────────
     # (same as before — streak from previous run's conviction scan)
     try:
         from persistence import get_all_active as _get_conv_active
@@ -239,7 +241,7 @@ def run_trade_scan(
     except Exception as _cse:
         logger.debug(f"TRADE SCAN: Conviction streak boost skipped: {_cse}")
 
-    # ── Step 6: Holdings Alert — TheWrap signals for held positions only ────────
+    # ── Step 7: Holdings Alert — TheWrap signals for held positions only ────────
     # Loads Om-Holdings and scans ONLY those positions (fast — 40-60 stocks vs 1500+).
     # Output: one row per holding sorted by urgency — the morning "what to do" view.
     logger.info("TRADE SCAN: Running Holdings Alert (TheWrap scan)...")
@@ -267,7 +269,7 @@ def run_trade_scan(
 
     logger.info(f"TRADE SCAN: Holdings Alert — {len(holdings_alert_df)} positions analysed")
 
-    # ── Step 7: Quality threshold → sort → top 20 ────────────────────────────
+    # ── Step 8: Quality threshold → sort → top 20 ────────────────────────────
     # Regime now only affects position sizing (handled by user) — NOT list size.
     # All stocks scoring ≥ 40 are shown (up to 20). In a bear market, fewer
     # stocks naturally clear the threshold — the list shrinks organically.
@@ -284,7 +286,7 @@ def run_trade_scan(
 
     logger.info(f"TRADE SCAN ✓ {len(top_candidates)} trade candidates (regime: {regime_label})")
 
-    # ── Step 8: Daily BUY Conviction — 3 signals on full universe ────────────
+    # ── Step 9: Daily BUY Conviction — 3 signals on full universe ────────────
     # Computes Stage2 / RS / SEPA signals on EVERY stock (not just screener top-30).
     # Top-20 by conviction score with streak tracking.
     logger.info("TRADE SCAN: Running Daily BUY Conviction scan...")
@@ -312,7 +314,7 @@ def run_trade_scan(
             + traceback.format_exc()
         )
 
-    # ── Step 9: Data Quality — flag tickers with NaN price/volume or stale data ─
+    # ── Step 10: Data Quality — flag tickers with NaN price/volume or stale data ─
     logger.info("TRADE SCAN: Running Data Quality scan...")
     data_quality_df = pd.DataFrame()
     try:
@@ -321,17 +323,18 @@ def run_trade_scan(
     except Exception as _dqe:
         logger.warning(f"TRADE SCAN: Data Quality scan failed (non-fatal): {_dqe}")
 
-    # ── Step 10: Append 14-day exit history to screener tabs ─────────────────
+    # ── Step 11: Append 14-day exit history to screener tabs ─────────────────
     # Stocks that drop out of each screener are kept at the bottom for 14 days
     # with an "Exit Date" column showing when they left. The tabs are fixed (no
     # daily dated tabs) so this provides rolling history without tab proliferation.
     logger.info("TRADE SCAN: Appending 14-day exit history to screener tabs...")
     try:
-        # Snapshot active-only DFs before exits are appended so the trade
-        # reason function sees clean ticker lists (not separator/exited rows).
-        _active_stage = stage_df.copy() if not stage_df.empty else stage_df
-        _active_sepa  = sepa_df.copy()  if not sepa_df.empty  else sepa_df
-        _active_rs    = rs_df.copy()    if not rs_df.empty    else rs_df
+        # Use FULL POOLS (not display-frame top-N) for trade exit reason lookup.
+        # A stock ranked 35 in Stage is still an active Stage-2 candidate — using
+        # stage_df (top-30 display) would incorrectly report "Stage 2 lost" for it.
+        _active_stage = stage_pool.copy() if not stage_pool.empty else stage_pool
+        _active_sepa  = sepa_pool.copy()  if not sepa_pool.empty  else sepa_pool
+        _active_rs    = rs_pool.copy()    if not rs_pool.empty    else rs_pool
 
         stage_df = append_screener_exits(
             stage_df, bucket=f"stage_{market}",
@@ -424,33 +427,52 @@ def _score_candidate(
       Stage duration < 15 bars   × 0.85
       TW_FADING                  × 0.82   (demote, not eliminate)
     """
+    # ── Resolve raw ticker once — used for all OHLCV lookups below ───────────
+    # BUG FIX: _restore_ticker was called twice (TheWrap block + OHLCV block),
+    # iterating the suffix list twice per candidate.  Cache it here.
+    raw_ticker = _restore_ticker(ticker, ohlcv)
+
     # ── Hard gate 1: Weekly stage ─────────────────────────────────────────────
+    # BUG FIX: old code used a single ternary — if sepa_row is non-empty but
+    # lacks "Weekly Stage" (e.g. SEPA computation failed for this ticker), it
+    # returned "" → "Unknown" and never fell through to stage_row.  A Stage-only
+    # stock with W-S4 would slip through the hard gate.
+    # Fix: explicit fallback chain — sepa_row → stage_row → "Unknown".
     weekly_stage_str = (
-        str(sepa_row.get("Weekly Stage", "")) if sepa_row else
-        str(stage_row.get("Weekly Stage", "")) if stage_row else "Unknown"
+        str(sepa_row.get("Weekly Stage", "") or "")  if sepa_row  else ""
+    ) or (
+        str(stage_row.get("Weekly Stage", "") or "") if stage_row else ""
     ) or "Unknown"
     if weekly_stage_str in ("W-S1 Accum", "W-S4 Decline"):
         return None
 
     # ── TheWrap ───────────────────────────────────────────────────────────────
-    tw_str = str(sepa_row.get("TheWrap", "—")) if sepa_row else "—"
-    if not tw_str or tw_str in ("nan", "None", ""):
-        tw_str = "—"
-    # Compute from OHLCV when not in sepa_row
-    if tw_str == "—":
-        _raw = ohlcv.get(_restore_ticker(ticker, ohlcv), pd.DataFrame())
+    # BUG FIX: same fallback-chain issue as weekly_stage above.
+    # Priority: sepa_row → stage_row → recompute from OHLCV.
+    # Recomputing from OHLCV is the last resort — stage_row already has it
+    # pre-computed; using it avoids a silent failure on the OHLCV path.
+    tw_str = (
+        str(sepa_row.get("TheWrap",  "") or "") if sepa_row  else ""
+    ) or (
+        str(stage_row.get("TheWrap", "") or "") if stage_row else ""
+    )
+    if not tw_str or tw_str in ("nan", "None", "⚪ No Data"):
+        # Recompute from OHLCV as last resort (stocks that only appear in RS pool)
+        _raw = ohlcv.get(raw_ticker, pd.DataFrame())
         if not _raw.empty:
             try:
-                _tw_code, _tw_lbl, *_ = _compute_thewrap(_to_weekly_ohlcv(_raw))
+                _, _tw_lbl, *_ = _compute_thewrap(_to_weekly_ohlcv(_raw))
                 tw_str = _tw_lbl
             except Exception:
                 pass
-    # Hard gate 2: TW_EXIT — structure broken
+    if not tw_str:
+        tw_str = "—"
+    # Hard gate 2: TW_EXIT — multi-month structure broken, don't fight it
     if any(x in tw_str for x in ("TW_EXIT", "TW: Exit")):
         return None
 
     # ── OHLCV ─────────────────────────────────────────────────────────────────
-    raw_df = ohlcv.get(_restore_ticker(ticker, ohlcv), pd.DataFrame())
+    raw_df = ohlcv.get(raw_ticker, pd.DataFrame())
     if raw_df.empty or len(raw_df) < 30:
         return None
     close       = float(raw_df["close"].iloc[-1])
@@ -462,27 +484,42 @@ def _score_candidate(
     entry_signal_stage = str(stage_row.get("Entry Signal", "")) if stage_row else ""
     is_cheat           = "Cheat Entry" in entry_signal_stage
 
+    # ── Helper: safe float parse for formatted SEPA percentage strings ─────────
+    def _safe_pct(val, default: float) -> float:
+        """Parse '±X.X%' strings; return default on any error."""
+        try:
+            return float(str(val).replace("%", "").replace("+", "").strip() or default)
+        except (ValueError, TypeError):
+            return default
+
     # Prefer SEPA's computed prices when available (SEPA already ran detect_base)
-    if sepa_row and sepa_row.get("Entry ₹") and float(sepa_row.get("Entry ₹", 0) or 0) > 0:
+    try:
+        _sepa_entry_val = float(sepa_row.get("Entry ₹") or 0) if sepa_row else 0.0
+    except (ValueError, TypeError):
+        _sepa_entry_val = 0.0
+
+    if sepa_row and _sepa_entry_val > 0:
         state         = str(sepa_row.get("Breakout State", ""))
-        entry_price   = float(sepa_row.get("Entry ₹",   close))
-        stop_price    = float(sepa_row.get("Stop ₹",    ema21 * 0.97))
-        pivot_dist    = float(str(sepa_row.get("Pivot Dist %", "0")).replace("%","").replace("+","").strip() or 0)
-        stop_dist_pct = float(str(sepa_row.get("Stop Dist %",  "7")).replace("%","").strip() or 7)
+        entry_price   = _sepa_entry_val
+        stop_price    = float(sepa_row.get("Stop ₹", ema21 * 0.97) or (ema21 * 0.97))
+        pivot_dist    = _safe_pct(sepa_row.get("Pivot Dist %", "0"), 0.0)
+        # BUG FIX: clamp stop_dist_pct — a data error returning 0 or negative
+        # would give stop_norm = 1.0 (perfect score) which inflates score_c.
+        stop_dist_pct = max(0.5, min(_safe_pct(sepa_row.get("Stop Dist %", "7"), 7.0), 15.0))
         # Override state with Cheat Entry if Stage confirms it (highest conviction)
         if is_cheat:
             state         = "AT_PIVOT"
             entry_price   = round(close * 1.001, 2)
             stop_price    = round(ema21 * 0.97,  2)
             pivot_dist    = round((close - ema21) / ema21 * 100, 1) if ema21 > 0 else 0.0
-            stop_dist_pct = max(0.5, (entry_price - stop_price) / entry_price * 100)
+            stop_dist_pct = max(0.5, min((entry_price - stop_price) / entry_price * 100, 15.0))
     elif is_cheat:
         # Cheat Entry without a SEPA row — compute from OHLCV
         state         = "AT_PIVOT"
         entry_price   = round(close * 1.001, 2)
         stop_price    = round(ema21 * 0.97,  2)
         pivot_dist    = round((close - ema21) / ema21 * 100, 1) if ema21 > 0 else 0.0
-        stop_dist_pct = max(0.5, (entry_price - stop_price) / entry_price * 100)
+        stop_dist_pct = max(0.5, min((entry_price - stop_price) / entry_price * 100, 15.0))
     else:
         # No SEPA row and not a cheat entry — detect from OHLCV directly
         _sepa_cfg   = SEPAConfig()
@@ -493,7 +530,7 @@ def _score_candidate(
         stop_dist_pct = max(0.5, (close - stop_price) / close * 100) if close > stop_price else 7.0
 
         if pivot_dist > 5.0 or pivot_dist < -8.0:
-            # Too extended or too far below — watchlist only if lenses are strong enough
+            # Too extended or too far below pivot — build base before acting
             state       = "IN_BASE"
             entry_price = round(pivot_high * 1.002, 2)
         elif pivot_dist > 0:
@@ -503,13 +540,17 @@ def _score_candidate(
             state       = "AT_PIVOT"
             entry_price = round(pivot_high * 1.002, 2)
         else:
+            # 3–8% below pivot — pulled back into the base after a breakout attempt
             state       = "WEAK_BREAKOUT"
             entry_price = round(pivot_high * 1.002, 2)
 
-    # Hard gate 3: stop too wide to size
+    # Hard gate 3: stop too wide to size — ELIMINATE, do not fake a tighter stop.
+    # BUG FIX: old code set stop_price = entry * 0.92 and stop_dist_pct = 8.0,
+    # flowing through with an inflated stop_norm (good risk score for a bad setup).
+    # A >11% stop means the stock is too volatile or too extended for a proper entry.
+    # Minervini rule: if you can't define a 7-8% stop, skip the trade.
     if stop_dist_pct > 11.0:
-        stop_price    = round(entry_price * 0.92, 2)
-        stop_dist_pct = 8.0
+        return None
 
     # Risk % for display
     risk_pct = round((entry_price - stop_price) / entry_price * 100, 1) if entry_price > stop_price > 0 else stop_dist_pct
@@ -547,15 +588,24 @@ def _score_candidate(
         entry_quality = "👁 Watchlist"
 
     # ── C. Risk Quality (0–20) ────────────────────────────────────────────────
-    stop_norm = min(max(0.0, (11.0 - stop_dist_pct) / 8.0), 1.0)  # 3%→1.0, 11%→0.0
-    _prox_dist = abs(pivot_dist) if not is_cheat else abs((close - ema21) / ema21 * 100) if ema21 > 0 else 0.0
-    prox_norm  = max(0.0, 1.0 - _prox_dist / 8.0)                  # 0%→1.0, 8%→0.0
-    score_c    = stop_norm * 10.0 + prox_norm * 10.0               # 0–20
+    # stop_norm:  tight stop = high score.  3% stop → 1.0,  11% stop → 0.0
+    # prox_norm:  close to pivot = high score.  0% away → 1.0,  8% away → 0.0
+    #
+    # BUG FIX: old _prox_dist had a redundant `is_cheat` branch that recomputed
+    # `(close - ema21) / ema21 * 100` — identical to the already-assigned
+    # `pivot_dist` for cheat entries.  Use abs(pivot_dist) unconditionally.
+    stop_norm  = min(max(0.0, (11.0 - stop_dist_pct) / 8.0), 1.0)  # 3%→1.0, 11%→0.0
+    prox_norm  = max(0.0, 1.0 - abs(pivot_dist) / 8.0)              # 0%→1.0, 8%→0.0
+    score_c    = stop_norm * 10.0 + prox_norm * 10.0                # 0–20
 
     # ── D. Volume Conviction (0–15) ───────────────────────────────────────────
+    # BUG FIX: old code used a single ternary — if sepa_row exists but lacks
+    # "Vol Conv" (e.g. RS-only stock), the empty string caused "Normal" (5 pts)
+    # even when stage_row had "Very High".  Fix: explicit fallback chain.
     vol_conv = (
-        str(sepa_row.get("Vol Conv",      "")) if sepa_row  else
-        str(stage_row.get("Vol Conviction","")) if stage_row else ""
+        str(sepa_row.get("Vol Conv",       "") or "") if sepa_row  else ""
+    ) or (
+        str(stage_row.get("Vol Conviction","") or "") if stage_row else ""
     )
     if "Very High" in vol_conv: score_d = 15.0
     elif "High"    in vol_conv: score_d = 10.0
@@ -608,10 +658,21 @@ def _score_candidate(
         return None
 
     # ── Action label ──────────────────────────────────────────────────────────
+    # BUG FIX: old code had a gap — BREAKOUT/AT_PIVOT stocks scoring 55–71 fell
+    # through to "👁 WATCHLIST" with no actionable signal.  A stock at the exact
+    # pivot with decent conviction should get "NEAR PIVOT" (place buy stop).
+    #
+    # Four tiers:
+    #   🟢 BUY NOW      score ≥ 72, at/near the trigger (Minervini: act immediately)
+    #   🔔 NEAR PIVOT   score 55–71, at/near the trigger (buy stop order, manage size)
+    #   📋 BASE BUILDING any score ≥ 40, stock building a base (set alert for breakout)
+    #   👁 WATCHLIST    everything else (monitor, no immediate action)
     if score >= 72 and (is_cheat or state in ("BREAKOUT", "AT_PIVOT")):
         action = "🟢 BUY NOW"
-    elif score >= 55 and state in ("WEAK_BREAKOUT", "IN_BASE"):
+    elif score >= 55 and (is_cheat or state in ("BREAKOUT", "AT_PIVOT")):
         action = "🔔 NEAR PIVOT"
+    elif state in ("WEAK_BREAKOUT", "IN_BASE"):
+        action = "📋 BASE BUILDING"
     else:
         action = "👁 WATCHLIST"
 
@@ -824,22 +885,6 @@ def _quick_rsi(df: pd.DataFrame, period: int = 14) -> float:
     return round(100 - 100 / (1 + avg_gain / avg_loss), 1)
 
 
-def _estimate_pivot(df: pd.DataFrame, price: float) -> float:
-    """Estimate the nearest resistance pivot from recent 20-bar high."""
-    if df.empty or "high" not in df.columns:
-        return price * 1.005
-    recent_high = float(df["high"].iloc[-20:].max()) if len(df) >= 20 else price
-    return round(recent_high * 1.005, 2)
-
-
-def _pct_val(v) -> float:
-    if isinstance(v, (int, float)):
-        return float(v)
-    try:
-        return float(str(v).replace("%", "").replace("+", "").strip())
-    except (ValueError, AttributeError):
-        return 0.0
-
 
 # =============================================================================
 # EXIT REASON DIAGNOSTICS
@@ -927,9 +972,16 @@ def _sepa_exit_reason(ticker: str, saved_row: dict, ohlcv: dict) -> str:
         return ""   # same: insufficient history this run
 
     try:
-        price   = float(close.iloc[-1])
-        high_20 = float(close.iloc[-20:].max())
-        dist    = (price - high_20) / high_20 * 100   # +ve = past pivot, -ve = below
+        price = float(close.iloc[-1])
+        # BUG FIX: old code used close.iloc[-20:].max() as the pivot proxy.
+        # Closing prices understate the 20-bar high — a stock that peaked intra-day
+        # and closed lower would show a smaller distance than its real pullback.
+        # Use the actual high series (canonical Minervini/Weinstein pivot definition).
+        if "high" in df.columns and len(df) >= 20:
+            high_20 = float(df["high"].dropna().iloc[-20:].max())
+        else:
+            high_20 = float(close.iloc[-20:].max())
+        dist    = (price - high_20) / high_20 * 100   # +ve = extended, -ve = below pivot
 
         # Stage break overrides everything
         if len(close) >= 200:
