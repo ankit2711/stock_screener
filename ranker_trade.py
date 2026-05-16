@@ -623,6 +623,18 @@ def _build_tier_a(sepa_df: pd.DataFrame, stage_map: dict, rs_map: dict,
         if stage_dur < 15:   # < 3 weeks — still establishing structure, genuine noise risk
             score *= 0.85    # 15% haircut — still tradeable, just discounted
 
+        # ── Cheat Entry bonus ─────────────────────────────────────────────────
+        # BUG FIX: The +12 Cheat Entry bonus was only applied in Path 2
+        # (_build_tier_a_stage_rs). Stocks that are ALSO in the SEPA pool get
+        # processed here in Path 1 first, then the exclude-set blocks them from
+        # Path 2 — so they NEVER got the bonus. Applying it here ensures any
+        # Cheat Entry confirmed by the Stage screener gets the signal credit
+        # regardless of which path processes it first.
+        cheat_signal = str(stage_row.get("Entry Signal", "")) if stage_row else ""
+        if "Cheat Entry" in cheat_signal:
+            score += 12.0
+            reason = f"Cheat Entry | {reason}"
+
         # ── Sector rotation multiplier ─────────────────────────────────────────
         # get_sector_for_ticker() looks up the sector of `ticker` in metadata,
         # maps it to the matching SectorResult, and returns it (or None if unknown).
