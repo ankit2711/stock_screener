@@ -382,36 +382,31 @@ OUTPUT_COLUMNS_RS = [
 # Column order: identity → tier/action → execution → conviction → scores → context → tracking
 OUTPUT_COLUMNS_TRADE = [
     "Rank",
-    "Tier",            # 🟢 Trade Now (active entry) | 👁 Watchlist (wait for FTD)
-    "Ticker",          # clickable → TradingView
+    "Ticker",           # clickable → TradingView
     "Company",
-    # ── Action & persistence ──────────────────────────────────────────────────
-    "Action",          # 🟢 BUY NOW / 🔔 BUY STOP / 🟡 CONFIRM VOL / 📋 ALERT
-    "Streak",          # consecutive days as Trade Candidate — longer = setup maturing, higher conviction
-    "First Entry",     # date first appeared as trade candidate (setup age)
-    # ── Execution ─────────────────────────────────────────────────────────────
-    "Entry ₹",         # exact price to enter
-    "Stop ₹",          # hard stop-loss level
-    "Risk %",          # (entry − stop) / entry × 100
-    "Pos Size %",      # regime-adjusted position size: (1%/stop%) × regime_factor, cap 8%
-    # ── Conviction (why this stock?) ──────────────────────────────────────────
-    "Signal Summary",  # RS Leading ✓ | VCP 3 | Weekly S2 ✓ | 1st base ...
-    "Reason",          # which screeners confirmed it: Stage2+SEPA+RS / SEPA+RS / Stage2+SEPA / SEPA
-    # ── Quality scores ────────────────────────────────────────────────────────
-    "Trade Score",     # 0–100 unified regime-aware composite
-    "RS Score",        # RS Leader score 0–100 (institutional holding strength)
-    "SEPA Score",      # SEPA entry quality (regime-adjusted)
-    # ── Market & sector context ───────────────────────────────────────────────
-    "Regime ⚠",        # ✅ Bull / 🟡 Mild Bull / 🟠 Neutral / 🔴 Caution / 🚨 Bear
+    # ── Action & entry ────────────────────────────────────────────────────────
+    "Action",           # 🟢 BUY NOW / 🔔 NEAR PIVOT / 👁 WATCHLIST
+    "Entry Quality",    # 🟢 Cheat Entry / 🟢 Fresh Breakout / 🔔 At Pivot / etc.
+    "Streak",           # consecutive days as Trade Candidate
+    "First Entry",      # date first appeared as trade candidate
+    # ── Execution levels ──────────────────────────────────────────────────────
+    "Entry ₹",          # exact price to enter
+    "Stop ₹",           # hard stop-loss level
+    "Risk %",           # (entry − stop) / entry × 100
+    # ── Conviction ────────────────────────────────────────────────────────────
+    "Signal Summary",   # RS Leading | Stage + SEPA + RS | W-Confirmed | VCP 3× ...
+    "Trade Score",      # 0–110 unified composite score
+    "RS Score",         # RS Leader score 0–100
+    "SEPA Score",       # SEPA entry quality score
+    "RSI(14)",
+    # ── Context ───────────────────────────────────────────────────────────────
+    "Regime ⚠",         # ✅ Bull / 🟡 Mild Bull / 🟠 Neutral / 🔴 Caution / 🚨 Bear
     "Sector",
-    "Sector Label",    # LEADING ▲ / IMPROVING ↑ / NEUTRAL → / WEAKENING ↓ / LAGGING ✕
-    # ── Exit tracking (only relevant for exited rows at bottom) ───────────────
-    "Exit Date",       # blank while active; date when candidate dropped out (kept 14 days)
-    "Exit Reason",     # why it left: e.g. "RS or Stage criteria lost" / "Breakout extended"
-    # Removed:
-    #   Stage S2    — internal debug score; Rank + Reason already encode structure quality
-    #   RSI(14)     — timing detail; Action + Breakout State already summarise it
-    #   Breakout State — Action (🟢 BUY NOW / 🔔 BUY STOP …) already communicates state
+    "Sector Label",     # LEADING ▲ / NEUTRAL → / LAGGING ✕
+    # ── Exit tracking ─────────────────────────────────────────────────────────
+    "Exit Date",
+    "Exit Reason",
+    "TradingView",
 ]
 
 # Holdings Alert — TheWrap-only exit view: ONLY held positions, sorted by urgency.
