@@ -380,12 +380,13 @@ def append_screener_exits(
     df:              pd.DataFrame,
     bucket:          str,
     key_col:         str = "Ticker",
-    days:            int = 14,
+    days:            int = 7,
     exit_col:        str = "Exit Date",
     exit_reason:     str = "Left scan",
     exit_reason_col: str = "Exit Reason",
     reentry_pool:    "pd.DataFrame | None" = None,
     data_as_of:      Optional[str] = None,
+    max_exits:       int = 10,
 ) -> pd.DataFrame:
     """
     Generic exit tracker for any screener tab.
@@ -408,7 +409,9 @@ def append_screener_exits(
         df:              current screener output DataFrame (must have key_col column)
         bucket:          unique key per screener+market  e.g. "stage_india", "trade_us"
         key_col:         column holding ticker identifiers (default "Ticker")
-        days:            calendar days to keep exited rows visible (default 14)
+        days:            calendar days to keep exited rows visible (default 7).
+                         Reduced from 14 — a 14-day window accumulates too many rows
+                         after schema changes or high-turnover sessions.
         exit_col:        column name for exit date (default "Exit Date")
         exit_reason:     short reason stamped when a ticker drops out (default "Left scan")
         exit_reason_col: column name for the reason (default "Exit Reason")
@@ -423,6 +426,8 @@ def append_screener_exits(
                          Uses date.today() if not provided. Pass this for full idempotency:
                          exit_date and last_seen are stamped with the data date, not the
                          run date, so re-running with the same data produces the same state.
+        max_exits:       maximum number of exited rows to display (default 10).
+                         Sorted by most-recent exit first — oldest drop off silently.
 
     Returns:
         DataFrame — active rows (top) + exited rows (bottom), sorted by exit_date DESC.
@@ -538,18 +543,27 @@ def append_screener_exits(
         if "Rank" in saved_row:
             saved_row["Rank"] = "—"
 
-        # Fill any column gaps so concat doesn't fail
+        # Fill any column gaps so concat doesn't fail.
+        # For text-label columns (Company, Sector, etc.) that are missing from
+        # old saved rows (schema changed), fall back to the ticker rather than
+        # "—" so the row is still identifiable without a company lookup.
         for col in df.columns:
             if col not in saved_row:
-                saved_row[col] = "—"
+                if col == "Company":
+                    # Ticker is always meaningful; "—" is not
+                    saved_row[col] = ticker
+                else:
+                    saved_row[col] = "—"
 
         exited_rows.append(saved_row)
 
     if not exited_rows:
         return df
 
-    # Sort exited rows: most recent exits first
+    # Sort exited rows: most recent exits first, then cap at max_exits
     exited_rows.sort(key=lambda r: r.get(exit_col, ""), reverse=True)
+    if max_exits and len(exited_rows) > max_exits:
+        exited_rows = exited_rows[:max_exits]
 
     # ── Visual separator between live section and exited section ──────────────
     separator = {col: "" for col in df.columns}
