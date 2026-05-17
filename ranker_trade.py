@@ -1067,12 +1067,100 @@ def _trade_exit_reason(ticker: str, saved_row: dict, ohlcv: dict,
                        rs_df: pd.DataFrame) -> str:
     """
     Why did this stock leave Trade Candidates?
-    Cross-references current screener outputs to identify which lens(es) dropped it,
-    then checks current OHLCV for breakout state context.
+
+    Diagnostic priority (stops at first match):
+      1. Hard gate hit     — EMA200 broken, stop hit, TheWrap EXIT, W-S4 Decline
+      2. Entry invalidated — extended past entry, breakout failed, base undercut
+      3. Lens membership   — which screeners this stock left (with EMA detail)
+      4. Score penalty     — RSI extension, TW_FADING, over-extension from EMA21
+      5. Score context     — what score it had and what state it was in
     """
+    # ── Saved context from last active appearance ──────────────────────────────
     last_state  = str(saved_row.get("Breakout State", ""))
     last_signal = str(saved_row.get("Signal Summary", ""))
+    last_action = str(saved_row.get("Action", ""))
+    last_quality = str(saved_row.get("Entry Quality", ""))
 
+    def _flt(val, default=0.0) -> float:
+        """Safe float — handles '₹1,234', '7.5%', '—', None."""
+        try:
+            return float(str(val).replace("₹","").replace("$","").replace("%","")
+                         .replace(",","").replace("+","").strip() or default)
+        except (ValueError, TypeError):
+            return default
+
+    last_score  = _flt(saved_row.get("Trade Score",  0))
+    last_entry  = _flt(saved_row.get("Entry ₹",      0))
+    last_stop   = _flt(saved_row.get("Stop ₹",       0))
+    last_rsi    = _flt(saved_row.get("RSI(14)",       0))
+    score_ctx   = f" (was {last_action}, score {last_score:.0f})" if last_score else ""
+
+    # ── Resolve OHLCV ──────────────────────────────────────────────────────────
+    raw_key  = _restore_ticker(ticker, ohlcv)
+    df_ohlcv = ohlcv.get(raw_key, pd.DataFrame())
+    has_data = not df_ohlcv.empty and "close" in df_ohlcv.columns and len(df_ohlcv) >= 30
+
+    if has_data:
+        close_s = df_ohlcv["close"].dropna()
+        price   = float(close_s.iloc[-1])
+        ema21   = float(close_s.ewm(span=21,  adjust=False).mean().iloc[-1])
+        ema50   = float(close_s.ewm(span=50,  adjust=False).mean().iloc[-1])
+        ema200  = float(close_s.ewm(span=200, adjust=False).mean().iloc[-1]) if len(close_s) >= 200 else 0.0
+        rsi_now = _quick_rsi(df_ohlcv)
+
+        # ── 1a. Stage 2 broken — most serious structural failure ───────────────
+        if ema200 > 0 and price < ema200:
+            pct = (ema200 - price) / ema200 * 100
+            return f"Stage 2 broken — price {pct:.1f}% below EMA200{score_ctx}"
+
+        # ── 1b. Stop level hit — trade invalidated ────────────────────────────
+        if last_stop > 0 and price < last_stop:
+            loss_pct = (last_stop - price) / last_stop * 100
+            entry_ref = f" (entry was ₹{last_entry:.0f})" if last_entry > 0 else ""
+            return f"Stop hit — price ₹{price:.0f} is {loss_pct:.1f}% below stop ₹{last_stop:.0f}{entry_ref}"
+
+        # ── 1c. TheWrap EXIT — weekly EMA structure broken ────────────────────
+        try:
+            tw_code, tw_lbl, *_ = _compute_thewrap(_to_weekly_ohlcv(df_ohlcv))
+            if "TW_EXIT" in tw_code:
+                return f"TheWrap EXIT — weekly EMAs broken{score_ctx}"
+        except Exception:
+            pass
+
+        # ── 1d. W-S4 Decline — Weinstein weekly stage broken ─────────────────
+        try:
+            from screeners.weekly_stage import to_weekly as _tw_resample, get_weekly_stage_weinstein as _wsg
+            _wdf = _tw_resample(df_ohlcv)
+            _wstage, _wlbl, _wsma, *_ = _wsg(_wdf)
+            if _wstage == 4:
+                pct = (price - _wsma) / _wsma * 100 if _wsma > 0 else 0.0
+                return f"W-S4 Decline — price {abs(pct):.1f}% below 30-week SMA ₹{_wsma:.0f}{score_ctx}"
+        except Exception:
+            pass
+
+        # ── 2a. Extended past entry — risk/reward gone ────────────────────────
+        if last_entry > 0 and price > last_entry:
+            ext = (price - last_entry) / last_entry * 100
+            if ext > 10:
+                return f"Extended {ext:.1f}% past entry ₹{last_entry:.0f} — buy stop no longer valid"
+            if ext > 5 and last_state in ("AT_PIVOT", "BREAKOUT"):
+                return f"Moved {ext:.1f}% past trigger ₹{last_entry:.0f} — chasing at poor risk/reward"
+
+        # ── 2b. Breakout failed — price fell back through entry ───────────────
+        if last_entry > 0 and last_state in ("BREAKOUT", "AT_PIVOT") and price < last_entry:
+            loss = (last_entry - price) / last_entry * 100
+            return f"Breakout failed — {loss:.1f}% below entry ₹{last_entry:.0f} (stop at ₹{last_stop:.0f})"
+
+        # ── 2c. Base undercut — price >7% below pivot ─────────────────────────
+        if "high" in df_ohlcv.columns and len(df_ohlcv) >= 20:
+            pivot = float(df_ohlcv["high"].dropna().iloc[-20:].max())
+            dist  = (price - pivot) / pivot * 100
+            if dist < -12:
+                return f"Base failed — {abs(dist):.1f}% below 20-day pivot ₹{pivot:.0f}"
+            if dist < -7 and last_state in ("BREAKOUT", "AT_PIVOT"):
+                return f"Breakout reversed — {abs(dist):.1f}% below trigger zone ₹{pivot:.0f}"
+
+    # ── 3. Lens membership loss — which screener dropped it ───────────────────
     def _has(df, t):
         if df is None or df.empty or "Ticker" not in df.columns:
             return False
@@ -1082,45 +1170,76 @@ def _trade_exit_reason(ticker: str, saved_row: dict, ohlcv: dict,
     in_sepa  = _has(sepa_df,  ticker)
     in_rs    = _has(rs_df,    ticker)
 
-    # Identify which lenses this stock originally passed (from Signal Summary), and which it lost
     had_stage = "Stage" in last_signal
     had_sepa  = "SEPA"  in last_signal
     had_rs    = "RS"    in last_signal
 
     lost = []
-    if had_stage and not in_stage: lost.append("Stage 2")
-    if had_sepa  and not in_sepa:  lost.append("SEPA setup")
-    if had_rs    and not in_rs:    lost.append("RS leadership")
+    if had_stage and not in_stage:
+        # Try to explain WHY Stage 2 was lost
+        if has_data:
+            parts = []
+            if ema200 > 0 and ema21 < ema200: parts.append(f"EMA21 ₹{ema21:.0f} below EMA200 ₹{ema200:.0f}")
+            elif ema21 < ema50:               parts.append(f"EMA21 ₹{ema21:.0f} crossed below EMA50 ₹{ema50:.0f}")
+            detail = f" ({'; '.join(parts)})" if parts else ""
+            lost.append(f"Stage 2{detail}")
+        else:
+            lost.append("Stage 2")
+
+    if had_sepa and not in_sepa:
+        if has_data and last_entry > 0:
+            gap = (price - last_entry) / last_entry * 100
+            if   gap < -5:   lost.append(f"SEPA setup ({abs(gap):.1f}% below pivot)")
+            elif gap > 8:    lost.append(f"SEPA setup (extended {gap:.1f}% past pivot)")
+            else:            lost.append("SEPA setup (setup invalidated)")
+        else:
+            lost.append("SEPA setup")
+
+    if had_rs and not in_rs:
+        rs_score = _flt(saved_row.get("RS Score", 0))
+        rs_str = f" (RS score was {rs_score:.0f})" if rs_score else ""
+        lost.append(f"RS leadership{rs_str}")
 
     if lost:
         still = []
         if in_stage: still.append("Stage ✓")
         if in_sepa:  still.append("SEPA ✓")
         if in_rs:    still.append("RS ✓")
-        suffix = f" | still: {', '.join(still)}" if still else ""
-        return f"{' + '.join(lost)} lost{suffix}"
+        still_str = f" | still holds: {', '.join(still)}" if still else " | all lenses lost"
+        return f"{'  +  '.join(lost)} lost{still_str}"
 
-    # If screener membership hasn't changed, diagnose from OHLCV pivot distance
-    raw_key = _restore_ticker(ticker, ohlcv)
-    df_ohlcv = ohlcv.get(raw_key, pd.DataFrame())
-    if not df_ohlcv.empty and "close" in df_ohlcv.columns:
-        close = df_ohlcv["close"].dropna()
-        if len(close) >= 20:
-            try:
-                price   = float(close.iloc[-1])
-                high_20 = float(close.iloc[-20:].max())
-                dist    = (price - high_20) / high_20 * 100
-                if last_state in ("BREAKOUT", "AT_PIVOT") and dist < -5:
-                    return f"Breakout failed — {abs(dist):.1f}% below pivot"
-                if dist > 10:
-                    return f"Extended {dist:+.1f}% — setup expired"
-            except Exception:
-                pass
+    # ── 4. Score penalty diagnosis — stock still in pools but scored out ───────
+    # Reached here = all lens memberships intact, no structural break found.
+    # Explain why the score dropped (RSI, TW_FADING, over-extension, sector).
+    if has_data:
+        penalties = []
+        if rsi_now > 82:
+            penalties.append(f"RSI {rsi_now:.0f} → ×0.88 penalty")
+        elif rsi_now > 75:
+            penalties.append(f"RSI {rsi_now:.0f} → ×0.95 penalty")
 
-    last_score = saved_row.get("Trade Score", "")
-    score_str  = f" — score was {float(last_score):.0f}" if last_score else ""
-    signal_ctx = f" (was: {last_signal})" if last_signal and last_signal != "—" else ""
-    return f"Ranked out of top {MAX_TRADE_CANDIDATES}{score_str}{signal_ctx}"
+        dist_ema21 = (price - ema21) / ema21 * 100 if ema21 > 0 else 0.0
+        if dist_ema21 > 12:
+            penalties.append(f"{dist_ema21:.1f}% above EMA21 (extended — wide stop)")
+        elif dist_ema21 > 7 and last_stop > 0:
+            stop_gap = (price - last_stop) / price * 100
+            if stop_gap > 11:
+                penalties.append(f"Stop now {stop_gap:.1f}% away (too wide to size)")
+
+        tw_str = str(saved_row.get("Signal Summary", ""))
+        if "TW: Fading" in tw_str:
+            penalties.append("TW Fading ×0.82 penalty active")
+
+        if penalties:
+            return (f"Score penalties: {' · '.join(penalties)}"
+                    f" → score dropped from {last_score:.0f}"
+                    f" | was {last_quality}")
+
+    # ── 5. Catch-all with maximum context ─────────────────────────────────────
+    state_ctx = f", was {last_state}" if last_state else ""
+    quality_ctx = f" ({last_quality})" if last_quality and last_quality not in ("—","") else ""
+    return (f"Scored below top {MAX_TRADE_CANDIDATES} threshold"
+            f" — score {last_score:.0f}{state_ctx}{quality_ctx}")
 
 
 def _empty_trade_result() -> pd.DataFrame:
