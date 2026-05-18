@@ -184,19 +184,18 @@ def _fetch_yfinance_chunked(
     per-ticker individual downloads for any that fail in the batch.
     Returns (results_dict, failed_tickers_list).
 
-    RECENT vs HISTORICAL fetch strategy:
-      ≤ 7 calendar day window  → period='5d'
-        yfinance's period parameter reliably returns the latest available bar
-        (including today after market close). The start/end date API often
-        returns empty or T-1 data for same-day or next-day windows because
-        yfinance resolves dates in UTC and EOD data may not yet be indexed.
+    FETCH STRATEGY — always explicit start/end dates:
+      yfinance's period='5d' was previously used for short windows but it
+      returns NaN OHLC for the current day on NSE stocks (volume arrives
+      before prices are finalised in yfinance's index), causing today's bar
+      to be silently dropped by our dropna filter.
 
-      > 7 calendar day window  → explicit start/end dates
-        For full history fetches, start/end is more precise and avoids
-        over-fetching months of data.
+      Explicit start/end dates always return complete OHLC when the bar is
+      done, on both NSE and US exchanges.  End is always set to today+1 day
+      (yfinance end is exclusive) so today's completed bar is included.
 
-    The SQLite cache uses INSERT OR IGNORE, so older bars returned by
-    period='5d' that are already cached are silently skipped.
+    The SQLite cache uses INSERT OR IGNORE, so older bars already in cache
+    are silently skipped.
     """
     results = {}
     failed  = []
@@ -210,25 +209,13 @@ def _fetch_yfinance_chunked(
     chunk_num = 0
 
     for (start_str, end_str), group in range_groups.items():
-        start_date = date.fromisoformat(start_str)
-        end_date   = date.fromisoformat(end_str)
-        days_range = (end_date - start_date).days   # 0 = same-day window (just today)
+        end_date = date.fromisoformat(end_str)
 
-        if days_range <= 7:
-            # Recent window — use period='5d' for reliable latest-bar delivery.
-            # This covers: daily update (0 days), weekend (2-3 days),
-            # long weekend / market holiday (4-7 days).
-            period_yf = "5d"
-            end_yf    = None          # not used when period is set
-            logger.debug(
-                f"  [{market.upper()}] Using period='5d' for {len(group)} tickers "
-                f"(window={days_range}d, start={start_str})"
-            )
-        else:
-            # Historical window — explicit dates are more precise.
-            # yfinance end is exclusive, so add 1 day to include end_str's bar.
-            period_yf = None
-            end_yf    = (end_date + timedelta(days=1)).isoformat()
+        # Always use explicit start/end dates.
+        # yfinance end is exclusive → add 1 day so today's completed bar is included.
+        # e.g. last_cached=May15, fetch window May16→May18: end_yf=May19 → returns May18 bar.
+        period_yf = None
+        end_yf    = (end_date + timedelta(days=1)).isoformat()
 
         chunks = [
             group[i: i + YF_CHUNK_SIZE]

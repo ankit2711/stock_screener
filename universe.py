@@ -20,7 +20,7 @@ import logging
 import requests
 import pandas as pd
 import yfinance as yf
-from config import US_MIN_MARKET_CAP_USD, INDIA_MIN_MARKET_CAP_INR
+from config import US_MIN_MARKET_CAP_USD, INDIA_MIN_MARKET_CAP_INR, US_WATCHLIST_TICKERS
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,13 @@ def get_us_tickers() -> list[str]:
     logger.info(f"US raw universe: {len(clean)} tickers — filtering by market cap...")
     filtered = _filter_by_marketcap_us(clean)
     logger.info(f"US filtered universe: {len(filtered)} tickers above ${US_MIN_MARKET_CAP_USD/1e9:.0f}B market cap")
+
+    # Merge in any watchlist overrides (user-specified tickers below the market cap floor)
+    watchlist = [t for t in US_WATCHLIST_TICKERS if t not in filtered]
+    if watchlist:
+        filtered = filtered + watchlist
+        logger.info(f"US watchlist override: added {len(watchlist)} ticker(s): {watchlist}")
+
     cache_module.save_universe("us", filtered)
     return filtered
 

@@ -41,8 +41,15 @@ MAX_HISTORY_TABS = 30
 # -----------------------------------------------------------------------------
 # MARKET UNIVERSE & FILTERS
 # -----------------------------------------------------------------------------
-US_MIN_MARKET_CAP_USD = 20_000_000_000       # $20B minimum
+US_MIN_MARKET_CAP_USD = 2_000_000_000        # $2B minimum — covers mid-cap growth (Minervini range)
 INDIA_MIN_MARKET_CAP_INR = 3_000_000_000    # ₹300 Crore minimum
+
+# Tickers that bypass the US_MIN_MARKET_CAP_USD filter.
+# Use this for specific stocks you want tracked regardless of market cap
+# (e.g. high-conviction setups in the $300M–$2B range).
+US_WATCHLIST_TICKERS: list[str] = [
+    "NNDM",    # Nano Dimension — $330M, below $2B floor
+]
 
 # Minimum average daily dollar volume — exchange-aware liquidity filter
 # Applied in ranker_stage, ranker_sepa, ranker_rs to remove untradeable stocks.
