@@ -2,8 +2,6 @@
 // Stage Analysis Screener
 // Replicates: Stage, RS, Momentum, Avg $ Volume, EMA Distance,
 //             Cheat Entry, Beta, PEAD, Market Cap
-// Author: Atlas (OpenClaw) for Ankit
-// Version: 1.0
 // ============================================================================
 
 //@version=6
