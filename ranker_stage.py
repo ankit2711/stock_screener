@@ -133,11 +133,46 @@ def run_screens_stage(
             w_stage, w_label, w_sma30, w_vol_dry, w_breakout_vol = \
                 get_weekly_stage_weinstein(weekly_df)
 
-            # Hard gate: weekly Stage 3 (distribution) or Stage 4 (decline)
-            # means the primary trend is deteriorating or already broken.
-            # No entry makes sense here regardless of how the daily looks.
-            if w_stage in (3, 4):
+            # Hard gate: weekly Stage 4 (decline) — price below a falling 30W-SMA.
+            # No entry makes sense: the primary trend is broken downward.
+            # W-S4 is eliminated unconditionally.
+            #
+            # W-S3 (above flat/falling SMA) is handled differently:
+            # • HARD GATE for W-S3 with negative Mansfield RS: stock is lagging
+            #   the market AND has a flat/declining trend — distribute, not buy.
+            # • SOFT PASS for W-S3 with strong RS (MRS > 10) AND price > 10%
+            #   above the 30W-SMA: this is a genuine breakout pattern where
+            #   the SMA has not yet responded to the price surge. Classic Minervini
+            #   first-base pattern — the MA will follow. Allow through with a 0.65×
+            #   score penalty (same as weekly_cap=W-S1 in SEPA).
+            #
+            # Design note: GlandPharma case (2026-05) — stock surged 25% in one
+            # week above the 30W-SMA while SMA slope lagged by 3 days. Hard gate
+            # eliminated it during the entire breakout window. The RS-gated soft
+            # pass ensures such genuine breakouts reach the screener while
+            # preventing weak W-S3 stocks (lagging RS, barely above SMA) from
+            # passing. W-S3 stocks that pass will have 35% score penalty so they
+            # appear behind confirmed W-S2 stocks with similar metrics.
+            if w_stage == 4:
                 continue
+            if w_stage == 3:
+                # Compute Mansfield RS and price-vs-SMA% to decide soft pass
+                w3_price_pct_above_sma = (
+                    (float(df["close"].iloc[-1]) - w_sma30) / w_sma30 * 100
+                    if w_sma30 > 0 else 0.0
+                )
+                # Allow through only if: price is well above SMA (>8%) AND
+                # weekly breakout volume signal fired this week
+                # OR price is significantly extended (>12%) showing strong bid
+                w3_soft_pass = (
+                    w3_price_pct_above_sma > 8.0 and w_breakout_vol
+                ) or w3_price_pct_above_sma > 12.0
+                if not w3_soft_pass:
+                    continue
+                # Mark with a score multiplier applied in _composite_score
+                w_stage_penalty = 0.65   # 35% penalty for unconfirmed weekly
+            else:
+                w_stage_penalty = 1.0    # W-S1/W-S2 — no penalty
 
             # ══════════════════════════════════════════════════════════════════
             # STEP B: DAILY STAGE — entry timing + detailed scoring
@@ -187,7 +222,7 @@ def run_screens_stage(
                 entry_label = "🔵 Vol Breakout (extended)"
 
             # ── Composite score ─────────────────────────────────────────────
-            score = _composite_score(result, entry_score)
+            score = _composite_score(result, entry_score, w_stage_penalty)
 
             row = _result_to_row(result, meta, ticker, entry_score, entry_label,
                                  score, w_breakout_vol)
@@ -465,18 +500,29 @@ def _entry_signal(df: pd.DataFrame, result: StageAnalysisResult):
 # COMPOSITE SCORE
 # =============================================================================
 
-def _composite_score(result: StageAnalysisResult, entry_score: float) -> float:
+def _composite_score(
+    result: StageAnalysisResult,
+    entry_score: float,
+    w_stage_penalty: float = 1.0,
+) -> float:
     """
     Combined score for ranking Stage-2 stocks.
 
     Components (sum = 100%):
         Stage-2 quality   40%   s2_score / 10 (max possible Stage-2 score)
-        RS strength       18%   Mansfield RS > 0 (outperforming benchmark)
+        RS strength       18%   Mansfield RS graduated (>20/10/0 → 18/15/10%)
         Momentum          22%   Strong↑↑: 22% | Rising↑: 11%
         Weekly confirm     8%   W-S2 = +8% | W-S1 transitioning = +3% | W-Unknown = +2%
         Entry signal       6%   cheat entry: 6% | EMA pullback: ~4% | near 4wk high: 2.4%
         Vol dry in base    3%   Weinstein's volume pattern in base — accumulation signal
         Volume conviction  3%   Very High: 3% | High: 1.5%
+
+    w_stage_penalty:
+        1.0  — W-S2 confirmed or W-S1 (full score)
+        0.65 — W-S3 soft-pass (price well above SMA but SMA not yet rising;
+                genuine breakout lag). Applied as a final score multiplier so that
+                W-S3 soft-pass stocks always rank below confirmed W-S2 stocks with
+                similar underlying metrics.
 
     Weekly confirmation replaces part of prior RS/Momentum allocation.
     Weinstein's primary classification is weekly — stocks confirmed on both
@@ -505,13 +551,16 @@ def _composite_score(result: StageAnalysisResult, entry_score: float) -> float:
     # W-S2 ✓:      price above rising 30-week SMA → full weekly confirmation
     # W-S1 Accum:  transitioning into S2 from below — valid early entry, partial credit
     # W-Unknown:   insufficient weekly history — no penalty, small uncertainty discount
-    # W-S3/S4:     already gated out — never reaches here
+    # W-S3 soft-pass: price significantly above flat SMA (genuine breakout lag);
+    #               allowed through at 0.65× final penalty — gets 0% weekly credit
+    #               since SMA not confirmed rising, but is not hard-gated out.
     if result.weekly_stage == 2:
         total += 0.08    # fully confirmed on weekly — highest conviction
     elif result.weekly_stage == 1:
         total += 0.03    # transitioning — potential early entry, lower confidence
     elif result.weekly_stage == 0:
         total += 0.02    # unknown history — small credit, no hard penalty
+    # weekly_stage == 3 (soft-pass): 0 weekly credit; penalty applied below
 
     # Volume dry-up in base (3%) — Weinstein's modern emphasis
     # Right-side of base showing declining volume = clean accumulation,
@@ -529,6 +578,9 @@ def _composite_score(result: StageAnalysisResult, entry_score: float) -> float:
     # Beta penalty: very high beta (>2.0) is riskier
     if result.beta > 2.0:
         total -= 0.05
+
+    # W-S3 soft-pass penalty: confirmed W-S2 stocks always rank above these
+    total *= w_stage_penalty
 
     return round(min(max(total, 0.0), 1.0), 4)
 

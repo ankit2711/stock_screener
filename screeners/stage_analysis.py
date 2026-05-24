@@ -284,7 +284,21 @@ def run_stage_analysis(
     # -------------------------------------------------------------------------
     roc_fast_s = close.pct_change(cfg.mom_fast) * 100
     roc_slow_s = close.pct_change(cfg.mom_slow) * 100
-    mom_accel  = roc_fast_s.iloc[-1] - roc_fast_s.iloc[-4]  # accel over 3 bars
+
+    # Acceleration uses a 5-bar lookback (was 3-bar).
+    # 3-bar lookback: accel(t) = ROC_fast(t) - ROC_fast(t-3)
+    # This is extremely noisy on post-breakout bars — a single big day in
+    # the ROC window causes a 15-20% ROC, then the next day shows lower
+    # accel because that big day is still in the window (denominator effect).
+    # Result: GLAND at +22% ROC_fast classified "Rising ↑" not "Strong ↑↑"
+    # purely because May 21 had a higher ROC than May 22 (same breakout, 1 day later).
+    #
+    # Fix: 5-bar lookback smooths out single-day spikes.
+    # Threshold: ROC_fast > 15% is unconditionally "Strong ↑↑" regardless of
+    # acceleration direction — a stock up 15%+ in 10 days IS in strong momentum.
+    # This is the Minervini/Weinstein "power move" condition.
+    mom_accel_lookback = min(5, max(1, len(roc_fast_s) - 1))
+    mom_accel = roc_fast_s.iloc[-1] - roc_fast_s.iloc[-1 - mom_accel_lookback]
 
     roc_f = roc_fast_s.iloc[-1]
     roc_s = roc_slow_s.iloc[-1]
@@ -293,7 +307,12 @@ def run_stage_analysis(
     result.roc_slow   = round(roc_s, 2)
     result.mom_accel  = round(mom_accel, 2)
 
-    if roc_f > 0 and mom_accel > 0:
+    # "Power move" override: ROC_fast > 15% in 10 days is always "Strong ↑↑"
+    # regardless of acceleration direction. Prevents post-breakout deceleration
+    # noise from demoting genuinely strong momentum stocks.
+    if roc_f > 15.0:
+        result.mom_label = "Strong ↑↑"
+    elif roc_f > 0 and mom_accel > 0:
         result.mom_label = "Strong ↑↑"
     elif roc_f > 0 and mom_accel <= 0:
         result.mom_label = "Rising ↑"
