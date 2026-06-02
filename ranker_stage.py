@@ -295,6 +295,11 @@ def run_exit_monitor(
 
     for clean_ticker, held_info in holdings.items():
         # ── Find OHLCV data for this holding ─────────────────────────────────
+        # Primary: look in the in-memory ohlcv dict (already fetched + cached).
+        # Fallback: load directly from the DB — holdings must always be analysed
+        # even when the main universe fetch missed them (batch timeout, rate limit,
+        # DB lock during fetch, etc.).  Held positions are too important to silently
+        # drop to "No Data" just because a 2000-ticker batch had a hiccup.
         df = None
         found_key = None
         suffixes = [".NS", ".BO"] if market == "india" else [""]
@@ -308,8 +313,35 @@ def run_exit_monitor(
             df        = ohlcv[clean_ticker]
             found_key = clean_ticker
 
+        # DB fallback: ohlcv dict missed this holding (fetch failure/timeout)
         if df is None:
-            logger.debug(f"Exit Monitor: no OHLCV for holding '{clean_ticker}' — skipped (no data)")
+            try:
+                import cache as _cache
+                if market == "india":
+                    for sfx in (".NS", ".BO"):
+                        _df = _cache.load_ohlcv(clean_ticker + sfx)
+                        if _df is not None and len(_df) >= 60:
+                            df        = _df
+                            found_key = clean_ticker + sfx
+                            logger.info(
+                                f"Exit Monitor: DB fallback loaded '{found_key}' "
+                                f"({len(df)} bars) — was missing from ohlcv dict"
+                            )
+                            break
+                else:
+                    _df = _cache.load_ohlcv(clean_ticker)
+                    if _df is not None and len(_df) >= 60:
+                        df        = _df
+                        found_key = clean_ticker
+                        logger.info(
+                            f"Exit Monitor: DB fallback loaded '{clean_ticker}' "
+                            f"({len(df)} bars) — was missing from ohlcv dict"
+                        )
+            except Exception as _dbe:
+                logger.debug(f"Exit Monitor: DB fallback failed for '{clean_ticker}': {_dbe}")
+
+        if df is None:
+            logger.warning(f"Exit Monitor: no OHLCV for holding '{clean_ticker}' — showing as No Data")
             continue
 
         if len(df) < 60:
@@ -471,7 +503,8 @@ def _entry_signal(df: pd.DataFrame, result: StageAnalysisResult):
     ema21   = float(close.ewm(span=21, adjust=False).mean().iloc[-1])
     avg_vol = float(volume.rolling(50).mean().iloc[-1]) if len(volume) >= 50 else float(volume.mean())
     vol_10  = float(volume.iloc[-10:].mean())
-    vol_dry = vol_10 < avg_vol * 0.75   # volume 25% below baseline = quiet
+    vol_dry   = vol_10 < avg_vol * 0.75    # volume 25% below baseline = quiet (pre-breakout ideal)
+    vol_surge = vol_10 > avg_vol * 1.50    # volume 50% above baseline = institutional buying
 
     dist_from_ema21 = abs(price - ema21) / ema21 * 100
 
@@ -479,20 +512,30 @@ def _entry_signal(df: pd.DataFrame, result: StageAnalysisResult):
     if result.is_cheat_entry:
         return 1.00, "🟢 Cheat Entry"
 
-    # 2. EMA pullback: within 5% of 21 EMA with quiet volume
-    if dist_from_ema21 <= 5.0 and vol_dry:
-        # Score scales with tightness: 4% away = 0.65, 0% away = 0.72
+    # 2. EMA pullback: within 5% of 21 EMA.
+    # Vol-dry bonus: coiling = score 0.60–0.72. Without vol_dry: still valid,
+    # scored ×0.90 lower. Previously required vol_dry — wrongly excluded stocks
+    # approaching pivot with natural pre-breakout volume build (labeled Extended=0).
+    if dist_from_ema21 <= 5.0:
         closeness = max(0, (5.0 - dist_from_ema21) / 5.0) * 0.12 + 0.60
-        return round(closeness, 3), "🟡 EMA Pullback"
+        if vol_dry:
+            return round(closeness, 3), "🟡 EMA Pullback + Vol Dry"
+        return round(closeness * 0.90, 3), "🟡 EMA Pullback"
 
-    # 3. Near 4-week high (potential breakout setup)
+    # 3. Near 4-week high (approaching pivot — set buy-stop)
     high_4w = float(high.iloc[-21:-1].max()) if len(high) > 21 else float(high.max())
-    dist_from_4wh = (price - high_4w) / high_4w * 100   # negative = below, positive = above
+    dist_from_4wh = (price - high_4w) / high_4w * 100
 
     if -3.0 <= dist_from_4wh <= 1.0:
         return 0.40, "🔵 Near Pivot"
 
-    # 4. Extended / no signal
+    # 3b. Volume breakout — above pivot on significant volume (institutional buying confirmed).
+    # Stocks 1-8% past 4-week high on ≥1.5× avg volume are confirmed breakouts in progress,
+    # not "Extended" no-signal stocks. Previously scored 0 ("Extended").
+    if 1.0 < dist_from_4wh <= 8.0 and vol_surge:
+        return 0.30, "🔵 Vol Breakout"
+
+    # 4. Extended or no signal
     return 0.00, "⚪ Extended"
 
 
